@@ -497,7 +497,30 @@ const state: ConsoleState = { events: [] };
  *  outcome for the same id. */
 const gateResolutions = new Map<string, GateEvent['status']>();
 
+/**
+ * Fixture-only branch dependencies: gate-2's opening and gate-3's
+ * pre-authorised approval, plus the two `number` events that presuppose
+ * gate-1 was sent back, only make sense if the branch of the recorded call
+ * they belong to is the one that actually happened. A live emitter never
+ * needs this table, it only ever emits what actually occurred; this
+ * recorded script schedules every branch's events regardless of what an
+ * operator does with the ones already dispatched, which is exactly the gap
+ * `dispatch()` closes below.
+ */
+function branchRequirement(ev: ConsoleEvent): { gateId: string; status: GateEvent['status'] } | null {
+  if (ev.type === 'gate' && ev.id === 'gate-2') return { gateId: 'gate-1', status: 'sent_back' };
+  if (ev.type === 'gate' && ev.id === 'gate-3') return { gateId: 'gate-2', status: 'approved' };
+  if (ev.type === 'number' && ev.label === 'Net settlement, salvage retained') {
+    return { gateId: 'gate-1', status: 'sent_back' };
+  }
+  if (ev.type === 'number' && ev.label === 'Offer validity') return { gateId: 'gate-1', status: 'sent_back' };
+  return null;
+}
+
 function dispatch(ev: ConsoleEvent): void {
+  const requirement = branchRequirement(ev);
+  if (requirement && gateResolutions.get(requirement.gateId) !== requirement.status) return;
+
   if (ev.type === 'gate' && ev.status !== 'opened') {
     if (gateResolutions.has(ev.id)) return;
     gateResolutions.set(ev.id, ev.status);
