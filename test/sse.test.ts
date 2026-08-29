@@ -62,3 +62,10 @@ test('drops frames that carry no data field', async () => {
   assert.equal(frames.length, 1);
   assert.equal(frames[0]?.data, 'real');
 });
+
+test('frames a stream that uses lone carriage returns', async () => {
+  // The SSE spec allows CR, LF and CRLF. Normalising only CRLF silently
+  // loses every frame on a CR-only stream. Found by Qodo on PR 1.
+  const frames = await collect(streamOf('data: one\r\rdata: two\r\r'));
+  assert.deepEqual(frames.map((f) => f.data), ['one', 'two']);
+});

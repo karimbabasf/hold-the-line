@@ -48,6 +48,21 @@ export interface UnknownEvent {
 
 export type TurnEvent = ToolApprovalRequiredEvent | UnknownEvent;
 
+/**
+ * Narrows to an approval event, checking the fields the caller then uses.
+ *
+ * Matching on `type` alone hands back an object whose `thread_id` and
+ * `tool_calls` are typed as present and may not be, and the resume call built
+ * from them fails far from here with an unrelated server error.
+ */
 export function isApprovalRequired(e: TurnEvent): e is ToolApprovalRequiredEvent {
-  return e.type === 'tool.approval_required';
+  if (e.type !== 'tool.approval_required') return false;
+
+  const { thread_id: threadId, tool_calls: toolCalls } = e as Partial<ToolApprovalRequiredEvent>;
+  return (
+    typeof threadId === 'string' &&
+    threadId.length > 0 &&
+    Array.isArray(toolCalls) &&
+    toolCalls.every((c) => typeof c?.id === 'string' && c.id.length > 0)
+  );
 }
