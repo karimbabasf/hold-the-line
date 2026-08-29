@@ -9,3 +9,6 @@ build/
 *.log
 data/*.sqlite
 .tunnel-url
+
+# agent worktrees, never part of the repo
+.claude/worktrees/
