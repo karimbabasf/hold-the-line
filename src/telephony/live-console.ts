@@ -69,7 +69,24 @@ interface Provenance {
 
 const DEFAULT_BUFFER_LIMIT = 400;
 
+/** Units a bare spoken number is looked up under, most likely first. A
+ *  figure the agent framed as money is only ever looked up as money. */
+const UNIT_ORDER = ['days', 'percent', 'usd'] as const;
+
 const cents = (dollars: number): number => Math.round(dollars * 100);
+
+/**
+ * A ledger key is the unit as well as the number.
+ *
+ * Keying on the number alone put a 75 percent total-loss threshold and a
+ * $75.00 daily storage rate in the same slot, so whichever lane landed last
+ * decided what a spoken "$75.00" claimed as its source. A figure that
+ * inherits the wrong provenance is worse than one with none: it is an
+ * overclaim, which is the exact failure the counters exist to catch. Found
+ * by Qodo.
+ */
+const ledgerKey = (unit: string | undefined, value: number): string =>
+  `${unit ?? 'usd'}:${cents(value)}`;
 
 function tokenMatches(header: string | undefined, secret: string): boolean {
   const presented = header?.replace(/^Bearer /i, '') ?? '';
@@ -88,15 +105,17 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
   const clients = new Set<SseSink>();
   const buffer: Frame[] = [];
   /**
-   * The two frames a client cannot render the screen without, kept past the
-   * point the ring buffer drops them. Without the call frame a late client
-   * has no claim id and no header; without the latest hold frame its hold
-   * clock never starts. Everything else is safe to lose to the bound.
+   * The frames a client cannot render the screen without, kept past the point
+   * the ring buffer drops them. Without the call frame a late client has no
+   * claim id and no header; without the latest hold frame its hold clock
+   * never starts; and on a call that came back after a restart there is no
+   * call frame at all, only the session that resumed. Everything else is safe
+   * to lose to the bound.
    */
-  const pinned = new Map<'call' | 'hold', Frame>();
+  const pinned = new Map<'call' | 'hold' | 'session', Frame>();
 
-  const ledger = new Map<number, Provenance>();
-  const alreadySpoken = new Set<number>();
+  const ledger = new Map<string, Provenance>();
+  const alreadySpoken = new Set<string>();
   let turnText = '';
 
   let seq = 0;
@@ -107,17 +126,44 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
    * at t=1200 gives the console a negative hold clock.
    */
   let callStart: number | null = null;
+  /**
+   * Whose call is on screen.
+   *
+   * The console shows one call at a time, which is the product (spec section
+   * 1: one adjuster, one call at a time), and this is what keeps that from
+   * failing silently. A second caller's turn running at the same time would
+   * otherwise fold its hold and its spoken figures into the first caller's
+   * counters, which is an overclaim rather than a missing feature. See the
+   * scope note at the bottom of this file. Found by Qodo.
+   */
+  let currentCaller: string | null = null;
+  const warnedCallers = new Set<string>();
   let onHold = false;
   let pendingHold = false;
   let warnedUnconfigured = false;
 
+  /** True when this turn belongs to the call the console is showing. */
+  function ownsCall(callerId?: string): boolean {
+    if (callerId === undefined || currentCaller === null) return true;
+    if (callerId === currentCaller) return true;
+    if (!warnedCallers.has(callerId)) {
+      warnedCallers.add(callerId);
+      console.warn(
+        `console is showing the call from ${currentCaller}; the turn from ${callerId} is not ` +
+          'being rendered. This console follows one call at a time.',
+      );
+    }
+    return false;
+  }
+
   function push(frame: Frame, event: ConsoleEvent): void {
     buffer.push(frame);
-    // Only a call STARTING is pinned. A hangup now emits `call ended`, and
+    // Only a call STARTING is pinned. A hangup emits `call ended`, and
     // pinning that would replace the frame a late client renders its header
     // from, leaving it looking at a call it was never told began.
     if (event.type === 'call' && event.status === 'started') pinned.set('call', frame);
     else if (event.type === 'hold') pinned.set('hold', frame);
+    else if (event.type === 'session') pinned.set('session', frame);
     while (buffer.length > bufferLimit) buffer.shift();
   }
 
@@ -128,12 +174,21 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     // processes reporting into it.
     if (event.type === 'call' && event.status === 'started') {
       callStart = at ?? now();
+      currentCaller = event.caller ?? null;
+      warnedCallers.clear();
       buffer.length = 0;
       pinned.clear();
       ledger.clear();
       alreadySpoken.clear();
       turnText = '';
       onHold = false;
+    } else if (callStart === null && event.type === 'session' && event.status === 'resumed') {
+      // A call that came back after this process restarted never reports a
+      // `call started`: the bridge finds a checkpoint and reports a resume.
+      // Without anchoring here, every event on that call is stamped t: 0 and
+      // the console re-anchors its clocks to zero over and over. Found by
+      // Qodo.
+      callStart = at ?? now();
     }
     const stamped = {
       ...event,
@@ -141,7 +196,7 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     } as ConsoleEvent;
 
     if (stamped.type === 'number' && !stamped.spoken) {
-      ledger.set(cents(stamped.value), {
+      ledger.set(ledgerKey(stamped.unit, stamped.value), {
         label: stamped.label,
         from: stamped.from,
         run_id: stamped.run_id,
@@ -156,7 +211,7 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
 
     // A hold that was asked for before the call was reported goes out now,
     // in the order an operator reads: the call, then the caller waiting on it.
-    if (stamped.type === 'call' && stamped.status === 'started' && pendingHold) {
+    if (pendingHold && callStart !== null) {
       pendingHold = false;
       holdStarted();
     }
@@ -232,7 +287,8 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
 
   /** The caller is waiting in silence. Idempotent: a turn that starts while
    *  the line is already quiet does not restart the clock. */
-  function holdStarted(): void {
+  function holdStarted(callerId?: string): void {
+    if (!ownsCall(callerId)) return;
     if (onHold || pendingHold) return;
     if (callStart === null) {
       // The first turn opens the hold before the bridge has reported the
@@ -244,7 +300,8 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     emit({ type: 'hold', status: 'started' });
   }
 
-  function holdStopped(): void {
+  function holdStopped(callerId?: string): void {
+    if (!ownsCall(callerId)) return;
     pendingHold = false;
     if (!onHold) return;
     onHold = false;
@@ -254,18 +311,25 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
   /** Text on its way to TTS. Buffered rather than scanned per chunk, because
    *  a figure arrives split across deltas ("13,481" then " dollars and 12
    *  cents") and half a number is not a number. */
-  function noteSpokenText(text: string): void {
+  function noteSpokenText(text: string, callerId?: string): void {
+    if (!ownsCall(callerId)) return;
     turnText += text;
   }
 
   /** End of the agent's turn: everything it said is now complete text. */
-  function endSpokenTurn(): void {
+  function endSpokenTurn(callerId?: string): void {
+    if (!ownsCall(callerId)) return;
     const text = turnText;
     turnText = '';
     if (text === '') return;
 
     for (const found of extractSpokenNumbers(text)) {
-      const key = cents(found.value);
+      // Money spoken as money can only be money. A bare number could be any
+      // of the three, so the units it is most likely to be are tried first.
+      const key = found.money
+        ? ledgerKey('usd', found.value)
+        : (UNIT_ORDER.map((unit) => ledgerKey(unit, found.value)).find((k) => ledger.has(k))
+          ?? ledgerKey('usd', found.value));
       if (alreadySpoken.has(key)) continue;
       const known = ledger.get(key);
       // A figure with no tool behind it is only reported when the agent
@@ -300,3 +364,27 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     bufferedFrames: (): number => buffer.length,
   };
 }
+
+/**
+ * Known scope limit, flagged rather than hidden.
+ *
+ * This holds one call: one clock, one buffer, one hold state, one ledger.
+ * That matches the product (spec section 1: one adjuster, one call at a
+ * time) and the console itself, which has one header, one claim id and one
+ * set of counters. `gated.ts` carries the same limit on the draft slot for
+ * the same reason.
+ *
+ * What is enforced: a turn belonging to a caller other than the one on
+ * screen contributes no hold time and no spoken figures, and says so in the
+ * log once per caller. Without that, a second caller's speech would land on
+ * the first caller's provenance counters, which is an overclaim rather than
+ * a gap.
+ *
+ * What is not, and cannot be here: events reported by the MCP tool process
+ * carry no caller. TrueForge calls a tool with the tool's arguments and
+ * nothing else, so that process genuinely does not know whose call it is
+ * working on. Partitioning the console by caller needs a call id on the MCP
+ * wire, which is a protocol change beyond this file. Until then, two
+ * concurrent callers put both sets of lane and number events on one screen.
+ * The most recent `call started` takes the console.
+ */

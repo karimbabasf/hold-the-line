@@ -177,3 +177,42 @@ test('a batch is capped so one POST cannot exceed the body limit', async () => {
   assert.deepEqual(fake.posts.map((p) => p.frames.length), [4, 4, 1]);
   reporter.stop();
 });
+
+test('an event queued while a batch is in flight is not dropped in its place', async () => {
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const delivered: string[] = [];
+  let firstPost = true;
+
+  const impl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as ReportBatch;
+    if (firstPost) {
+      firstPost = false;
+      await held;
+    }
+    for (const f of body.frames) delivered.push((f.event as { name: string }).name);
+    return new Response('{}', { status: 202 });
+  }) as unknown as typeof fetch;
+
+  const reporter = reporterOn(impl, { batchSize: 2, maxQueue: 2 });
+
+  reporter.report({ type: 'lane', name: 'a', tool: 'a', status: 'pending' });
+  reporter.report({ type: 'lane', name: 'b', tool: 'b', status: 'pending' });
+  // Let the batch reach the POST and stop there.
+  await new Promise((r) => setTimeout(r, 10));
+
+  // The bound trims the queue while that POST is still open.
+  reporter.report({ type: 'lane', name: 'c', tool: 'c', status: 'pending' });
+  reporter.report({ type: 'lane', name: 'd', tool: 'd', status: 'pending' });
+  reporter.report({ type: 'lane', name: 'e', tool: 'e', status: 'pending' });
+
+  release();
+  await reporter.flush();
+
+  assert.ok(delivered.includes('d'), `d was never sent: delivered ${delivered.join(',')}`);
+  assert.ok(delivered.includes('e'), `e was never sent: delivered ${delivered.join(',')}`);
+  assert.equal(reporter.pending(), 0);
+  // Only the frames the bound actually evicted are counted as dropped.
+  assert.equal(reporter.dropped(), 5 - delivered.length);
+  reporter.stop();
+});

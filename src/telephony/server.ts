@@ -137,20 +137,23 @@ const bridge = createBridge({
  * tool's provenance; a money figure that matches nothing is reported with no
  * provenance at all, which the console renders red. That is the failure this
  * project exists to make visible, so it is never given a default.
+ *
+ * The caller id goes with both, so a second caller ringing in while this call
+ * is on screen cannot fold their hold time or their figures into it.
  */
 async function* observedTurn(userText: string, callerId: string) {
-  live.holdStarted();
+  live.holdStarted(callerId);
   try {
     for await (const delta of bridge.runTurn(userText, callerId)) {
       if (delta.text) {
-        live.holdStopped();
-        live.noteSpokenText(delta.text);
+        live.holdStopped(callerId);
+        live.noteSpokenText(delta.text, callerId);
       }
       yield delta;
     }
   } finally {
-    live.holdStopped();
-    live.endSpokenTurn();
+    live.holdStopped(callerId);
+    live.endSpokenTurn(callerId);
   }
 }
 

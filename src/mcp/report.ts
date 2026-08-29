@@ -114,13 +114,29 @@ export function createReporter(options: ReporterOptions = {}) {
     timer.unref?.();
   }
 
+  /** Enforces the bound, counting what it evicts. */
+  function trimToBound(): void {
+    while (queue.length > maxQueue) {
+      queue.shift();
+      droppedCount++;
+    }
+  }
+
   /** Sends as much of the queue as the far end will take. True when it
    *  emptied. */
   async function pump(): Promise<boolean> {
     while (queue.length > 0) {
-      const batch = queue.slice(0, batchSize);
-      if (!(await post(batch))) return false;
-      queue.splice(0, batch.length);
+      // Taken OUT of the queue before the await, not read and removed by
+      // count after it. `report()` can evict from the front of the queue
+      // while a POST is open, and removing `batch.length` items afterwards
+      // would then delete newer frames that were never sent, silently and
+      // without counting them as dropped. Found by Qodo.
+      const batch = queue.splice(0, batchSize);
+      if (!(await post(batch))) {
+        queue.unshift(...batch);
+        trimToBound();
+        return false;
+      }
       backoff = retryMs;
     }
     return true;
@@ -158,10 +174,7 @@ export function createReporter(options: ReporterOptions = {}) {
     report(event: ConsoleEventBody): void {
       if (!enabled) return;
       queue.push({ at: now(), event });
-      while (queue.length > maxQueue) {
-        queue.shift();
-        droppedCount++;
-      }
+      trimToBound();
       scheduleKick();
     },
 

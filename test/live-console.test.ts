@@ -347,3 +347,114 @@ test('a hold that starts and stops before any call never reports a negative cloc
 
   assert.equal(client.events().length, 0, 'a hold with no call behind it was reported anyway');
 });
+
+// ---------------------------------------------------------------------------
+// Found by Qodo.
+
+test('a spoken dollar amount never inherits a percentage of the same number', () => {
+  const live = createLiveConsole({ ingestSecret: SECRET });
+  const client = sink();
+  live.attach(client);
+  live.emit({ type: 'call', status: 'started' });
+
+  // The real pair: claim.json reports a $75.00 storage rate, state_rules
+  // reports a 75% threshold. Both are 7500 cents, and which one a single
+  // numeric key holds is then decided by which lane happened to land last.
+  live.emit({
+    type: 'number', label: 'Yard storage rate', value: 75,
+    from: 'record', source: 'claim.json:storage_per_day', unit: 'usd', spoken: false,
+  });
+  live.emit({
+    type: 'number', label: 'Total loss threshold', value: 75,
+    from: 'record', source: 'state_rules.json:total_loss_threshold_pct', unit: 'percent', spoken: false,
+  });
+
+  live.noteSpokenText('Storage runs $75.00 a day.');
+  live.endSpokenTurn();
+
+  const spoken = client.events().filter((e) => e.type === 'number' && e.spoken);
+  assert.equal(spoken.length, 1);
+  const said = spoken[0] as unknown as Record<string, unknown>;
+  assert.equal(said['label'], 'Yard storage rate');
+  assert.equal(said['unit'], 'usd');
+  assert.equal(said['source'], 'claim.json:storage_per_day');
+});
+
+test('a resumed session anchors the call clock instead of stamping everything zero', () => {
+  let clock = 2_000_000;
+  const live = createLiveConsole({ now: () => clock });
+  const client = sink();
+  live.attach(client);
+
+  // A telephony restart loses the call, and a caller ringing back resumes.
+  // The bridge reports a session, never a call.
+  live.broadcast({ type: 'session', t: 0, status: 'resumed', session_id: 'sess-7c21' });
+  clock += 4_000;
+  live.emit({ type: 'lane', name: 'state rules', tool: 'state_rules.get', status: 'pending' });
+
+  const events = client.events();
+  assert.equal(events[0]?.t, 0);
+  assert.equal(events[1]?.t, 4_000, 'every event after a resume was stamped t: 0');
+});
+
+test('a resumed call still opens the hold that was waiting on it', () => {
+  const live = createLiveConsole();
+  const client = sink();
+  live.attach(client);
+
+  live.holdStarted();
+  live.broadcast({ type: 'session', t: 0, status: 'resumed', session_id: 'sess-7c21' });
+
+  const holds = client.events().filter((e) => e.type === 'hold');
+  assert.equal(holds.length, 1, 'the hold never opened on a resumed call');
+});
+
+test('a late client on a resumed call is told the session resumed', () => {
+  const live = createLiveConsole({ bufferLimit: 3 });
+  live.broadcast({ type: 'session', t: 0, status: 'resumed', session_id: 'sess-7c21' });
+  for (let i = 0; i < 10; i++) {
+    live.emit({ type: 'lane', name: `lane ${i}`, tool: `tool.${i}`, status: 'pending' });
+  }
+
+  const late = sink();
+  live.attach(late);
+  assert.equal(late.events()[0]?.type, 'session', 'a late client saw a call with no beginning');
+});
+
+test('a second caller does not fold their spoken figures into the call on screen', () => {
+  const live = createLiveConsole();
+  const client = sink();
+  live.attach(client);
+
+  live.emit({ type: 'call', status: 'started', caller: '+14155550142' });
+  live.emit({
+    type: 'number', label: 'Net settlement, cash', value: 13481.12,
+    from: 'computed', run_id: 'run-a', unit: 'usd', spoken: false,
+  });
+
+  // Another caller's turn, running at the same time. The console shows one
+  // call, so this one's speech must not land on it.
+  live.noteSpokenText('Your settlement is $9,180.12.', '+14155559999');
+  live.endSpokenTurn('+14155559999');
+  assert.equal(client.events().filter((e) => e.type === 'number' && e.spoken).length, 0);
+
+  // The caller the console is actually showing still gets through.
+  live.noteSpokenText('Your settlement is 13,481 dollars and 12 cents.', '+14155550142');
+  live.endSpokenTurn('+14155550142');
+  const spoken = client.events().filter((e) => e.type === 'number' && e.spoken);
+  assert.equal(spoken.length, 1);
+  assert.equal((spoken[0] as { value: number }).value, 13481.12);
+});
+
+test('a second caller does not move the hold clock of the call on screen', () => {
+  const live = createLiveConsole();
+  const client = sink();
+  live.attach(client);
+
+  live.emit({ type: 'call', status: 'started', caller: '+14155550142' });
+  live.holdStarted('+14155550142');
+  live.holdStopped('+14155559999');
+
+  const holds = client.events().filter((e) => e.type === 'hold');
+  assert.deepEqual(holds.map((h) => (h as { status: string }).status), ['started']);
+});
