@@ -86,12 +86,23 @@ stop >/dev/null 2>&1 || true
 : > "$PIDFILE"
 sleep 1
 
+# The token the claim tools present to write onto the operator console.
+#
+# The tools run in their own process (TrueForge takes MCP servers by remote
+# URL, so they cannot share telephony's), and telephony's listener is on a
+# public tunnel, so the ingest route between them is authenticated. Generated
+# here when nothing set it, and exported so both children agree: node's
+# --env-file does not override a variable already in the environment, so a
+# value in .env.local wins for both, and this one covers the case where there
+# is none. Never printed.
+export CONSOLE_INGEST_SECRET="${CONSOLE_INGEST_SECRET:-$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')}"
+
 echo "1/5  harness"
 nohup npx -y @truefoundry/trueforge > "$LOGS/trueforge.log" 2>&1 &
 record_pid $!; wait_for_port 8790 $! harness
 
 echo "2/5  claim tools"
-nohup node --experimental-strip-types src/mcp/server.ts > "$LOGS/mcp.log" 2>&1 &
+nohup node --env-file=.env.local --experimental-strip-types src/mcp/server.ts > "$LOGS/mcp.log" 2>&1 &
 record_pid $!; wait_for_port 8792 $! "claim tools"
 
 echo "3/5  telephony"
@@ -124,6 +135,13 @@ const n = (t.data ?? t.tools ?? []).length;
 console.log(`     ${n} tools registered`);
 if (!n) { console.error("     NO TOOLS. the agent will answer with nothing."); process.exit(1); }
 '
+
+# The agent itself. Editing agent.json used to change nothing, because the only
+# thing that ever created the agent was a one-off POST in the README and a
+# repeat of that returns 409. Publishing on every start is what makes an edit to
+# the instructions reach a running assistant.
+echo "     publishing agent.json"
+node --env-file=.env.local scripts/publish-agent.mjs
 
 started_clean=1
 
