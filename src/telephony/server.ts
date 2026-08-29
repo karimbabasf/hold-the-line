@@ -6,7 +6,11 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { stripTypeScriptTypes } from 'node:module';
+import { dirname, extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { TrueForgeClient } from '../trueforge/client.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
@@ -29,6 +33,17 @@ if (!SHARED_SECRET) {
 /** One caller utterance is a few hundred bytes. 64KB is generous and stops a
  *  single request eating memory on a public listener. */
 const MAX_BODY_BYTES = 64 * 1024;
+
+const CONSOLE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'console');
+
+const CONTENT_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.woff2': 'font/woff2',
+  '.png': 'image/png',
+  '.json': 'application/json; charset=utf-8',
+};
 
 const PORT = Number(process.env.PORT ?? 8791);
 const AGENT_NAME = process.env.TRUEFORGE_AGENT ?? 'northvane';
@@ -91,6 +106,41 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const url = req.url ?? '/';
       console.log(`${req.method} ${url}`);
+
+      // The operator console, served straight from source.
+      //
+      // Browsers cannot run TypeScript, so the .ts modules have their types
+      // stripped on the way out rather than built ahead of time. A build step
+      // is one more thing to forget on the morning of a demo, and there is
+      // nothing here that needs bundling.
+      if (url === '/console' || url.startsWith('/console/')) {
+        const rel = url === '/console' ? 'index.html' : url.slice('/console/'.length);
+        // Reject anything that climbs out of the console directory.
+        const safe = normalize(rel).replace(/^(\.\.[/\\])+/, '');
+        const file = join(CONSOLE_DIR, safe);
+        if (!file.startsWith(CONSOLE_DIR)) {
+          res.writeHead(403).end('forbidden');
+          return;
+        }
+        try {
+          const ext = extname(file);
+          if (ext === '.ts') {
+            const src = await readFile(file, 'utf8');
+            res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
+            // Import specifiers keep their .ts extension in source; the
+            // browser has to ask for the same paths this route serves.
+            res.end(stripTypeScriptTypes(src, { mode: 'strip' }));
+            return;
+          }
+          const body = await readFile(file);
+          res.writeHead(200, { 'content-type': CONTENT_TYPES[ext] ?? 'application/octet-stream' });
+          res.end(body);
+          return;
+        } catch {
+          res.writeHead(404).end('not found');
+          return;
+        }
+      }
 
       if (url === '/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
