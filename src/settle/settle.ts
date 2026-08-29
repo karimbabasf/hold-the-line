@@ -67,12 +67,38 @@ const toDollars = (cents: number): number => cents / 100;
  * and spoken to a customer.
  */
 export function daysBetween(from: string, to: string): number {
-  const start = Date.parse(`${from}T00:00:00Z`);
-  const end = Date.parse(`${to}T00:00:00Z`);
-  if (Number.isNaN(start) || Number.isNaN(end)) {
-    throw new Error(`daysBetween: expected YYYY-MM-DD, got "${from}" and "${to}"`);
+  return Math.round((parseUtcDate(to) - parseUtcDate(from)) / 86_400_000);
+}
+
+const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Parses `YYYY-MM-DD` as UTC midnight, rejecting impossible calendar dates.
+ *
+ * `Date.parse` is not enough on its own: it normalises rather than rejects,
+ * so "2026-02-30" quietly becomes 2 March and silently adds two days of
+ * interest to a payoff that gets read aloud to a customer.
+ */
+function parseUtcDate(value: string): number {
+  const match = DATE_ONLY.exec(value);
+  if (!match) {
+    throw new Error(`expected YYYY-MM-DD, got "${value}"`);
   }
-  return Math.round((end - start) / 86_400_000);
+  const [, y, m, d] = match;
+  const ms = Date.parse(`${value}T00:00:00Z`);
+  if (Number.isNaN(ms)) {
+    throw new Error(`expected YYYY-MM-DD, got "${value}"`);
+  }
+  // Round-trip check catches the normalised impossible dates.
+  const back = new Date(ms);
+  if (
+    back.getUTCFullYear() !== Number(y) ||
+    back.getUTCMonth() + 1 !== Number(m) ||
+    back.getUTCDate() !== Number(d)
+  ) {
+    throw new Error(`not a real calendar date: "${value}"`);
+  }
+  return ms;
 }
 
 let runCounter = 0;
@@ -112,17 +138,24 @@ export function settle(options: SettleOptions): SettleResult {
   // 3. Prior damage comes off, factory options go on.
   const priorCents = vehicle.prior_damage.reduce((a, d) => a + toCents(d.deduction), 0);
   const optionsCents = vehicle.options.reduce((a, o) => a + toCents(o.value), 0);
+  // A sum of several fixture fields is a computed value, not a record
+  // lookup, even though every input is a record. Tagging an aggregate as
+  // `record` would let the provenance counter report arithmetic as a direct
+  // lookup, which is exactly the claim this project has to be able to defend.
   lines.push({
     label: 'Prior damage',
     value: -toDollars(priorCents),
-    from: 'record',
-    detail: vehicle.prior_damage.map((d) => d.desc).join('; '),
+    from: vehicle.prior_damage.length > 1 ? 'computed' : 'record',
+    detail:
+      vehicle.prior_damage.length > 1
+        ? `sum of ${vehicle.prior_damage.map((d) => d.deduction.toFixed(2)).join(' + ')}`
+        : (vehicle.prior_damage[0]?.desc ?? 'none'),
   });
   lines.push({
     label: 'Factory options',
     value: toDollars(optionsCents),
-    from: 'record',
-    detail: vehicle.options.map((o) => o.name).join(', '),
+    from: 'computed',
+    detail: `sum of ${vehicle.options.map((o) => `${o.name} ${o.value.toFixed(2)}`).join(' + ')}`,
   });
 
   const acvCents = meanCents - priorCents + optionsCents;
@@ -145,8 +178,8 @@ export function settle(options: SettleOptions): SettleResult {
   lines.push({
     label: 'Title and registration',
     value: toDollars(feesCents),
-    from: 'record',
-    detail: `title ${rules.title_fee.toFixed(2)} plus registration ${rules.reg_fee.toFixed(2)}`,
+    from: 'computed',
+    detail: `sum of title ${rules.title_fee.toFixed(2)} + registration ${rules.reg_fee.toFixed(2)}`,
   });
   lines.push({
     label: 'Collision deductible',
@@ -161,6 +194,15 @@ export function settle(options: SettleOptions): SettleResult {
   const days = daysBetween(vehicle.lien.principal_as_of, options.through_date);
   if (days < 0) {
     throw new Error(`through_date ${options.through_date} is before the principal date`);
+  }
+  // The lender quotes a payoff good through a specific date. Extrapolating
+  // past it invents interest the lender has not agreed to, and understates
+  // the customer's net on a figure we are about to commit to.
+  if (daysBetween(options.through_date, vehicle.lien.good_through) < 0) {
+    throw new Error(
+      `through_date ${options.through_date} is past the lender quote validity ` +
+        `(${vehicle.lien.good_through}); request a fresh payoff quote`,
+    );
   }
   const payoffCents = toCents(vehicle.lien.principal) + toCents(vehicle.lien.per_diem * days);
   lines.push({

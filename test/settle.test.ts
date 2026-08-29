@@ -89,3 +89,48 @@ test('the ratio is above the threshold, which is what makes it a total loss', ()
   assert.ok(r.ratio_pct > 75.0);
   assert.equal(r.ratio_pct, 78.6);
 });
+
+test('a payoff cannot be quoted past the lender validity window', () => {
+  // The lender quotes good through 2026-10-02. Extrapolating past it invents
+  // interest the lender never agreed to, on a figure we are about to commit
+  // to out loud. Found by Qodo on PR 4.
+  assert.throws(
+    () => settle({ retain_salvage: false, through_date: '2026-10-03' }),
+    /past the lender quote validity/,
+  );
+  // The boundary itself is still fine.
+  assert.equal(settle({ retain_salvage: false, through_date: '2026-10-02' }).payoff, 8764.12);
+});
+
+test('impossible calendar dates are rejected, not normalised', () => {
+  // Date.parse normalises 2026-02-30 to 2 March, silently adding two days of
+  // interest. Found by Qodo on PR 4.
+  // 30 February parses fine and normalises to 2 March, so only the
+  // round-trip check catches it.
+  assert.throws(() => daysBetween('2026-02-30', '2026-03-05'), /not a real calendar date/);
+  // Month 13 is not valid ISO at all, so Date.parse rejects it first. Both
+  // paths are correct rejections, which is why this asserts on either.
+  assert.throws(
+    () => daysBetween('2026-13-01', '2026-13-05'),
+    /not a real calendar date|expected YYYY-MM-DD/,
+  );
+  assert.throws(() => daysBetween('2026-8-28', '2026-10-02'), /expected YYYY-MM-DD/);
+  // A real leap day still works.
+  assert.equal(daysBetween('2028-02-29', '2028-03-01'), 1);
+});
+
+test('an aggregate of several record fields is computed, not a record lookup', () => {
+  // Tagging a sum as `record` would let the provenance counter report
+  // arithmetic as a direct lookup, which breaks the one claim this project
+  // has to defend. Found by Qodo on PR 4.
+  const r = settle({ retain_salvage: false, through_date: THROUGH });
+  const byLabel = (needle: string) => r.lines.find((l) => l.label.includes(needle));
+
+  assert.equal(byLabel('Factory options')?.from, 'computed');
+  assert.match(byLabel('Factory options')?.detail ?? '', /sum of/);
+  assert.equal(byLabel('Title and registration')?.from, 'computed');
+  assert.match(byLabel('Title and registration')?.detail ?? '', /sum of/);
+
+  // A single stored field stays a record lookup.
+  assert.equal(byLabel('Collision deductible')?.from, 'record');
+});
