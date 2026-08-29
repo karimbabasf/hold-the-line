@@ -102,17 +102,24 @@ export function createChatEndpoint(
           }
           send(chunk({}, 'stop'));
         } catch (err) {
-          // A thrown error mid-stream cannot become an HTTP status, the
-          // headers are long gone. Say something rather than leaving a
-          // caller listening to silence.
-          send(
-            chunk({
-              content:
-                ' Sorry, something went wrong on my end. Let me get a person for you.',
-            }),
-          );
-          send(chunk({}, 'stop'));
-          console.error('runTurn failed mid-stream:', err);
+          if (hangup.signal.aborted) {
+            // The caller is gone, so the turn being cut short is the point,
+            // not a fault. Apologising into a dead line and logging it as a
+            // failure would make every hangup look like an outage.
+            console.log(`turn ended early: ${callerId} hung up`);
+          } else {
+            // A thrown error mid-stream cannot become an HTTP status, the
+            // headers are long gone. Say something rather than leaving a
+            // caller listening to silence.
+            send(
+              chunk({
+                content:
+                  ' Sorry, something went wrong on my end. Let me get a person for you.',
+              }),
+            );
+            send(chunk({}, 'stop'));
+            console.error('runTurn failed mid-stream:', err);
+          }
         } finally {
           send('data: [DONE]\n\n');
           if (!shut) {

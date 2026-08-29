@@ -79,7 +79,7 @@ if (!n) { console.error("     NO TOOLS. the agent will answer with nothing."); p
 # repeat of that returns 409. Publishing on every start is what makes an edit to
 # the instructions reach a running assistant.
 echo "     publishing agent.json"
-node scripts/publish-agent.mjs
+node --env-file=.env.local scripts/publish-agent.mjs
 
 cat <<EOF
 

@@ -147,12 +147,13 @@ const chat = createChatEndpoint({ runTurn: bridge.runTurn });
 /**
  * Wraps a Node request as a Fetch Request, carrying the hangup with it.
  *
- * The signal is the point. Without it the endpoint has no way to learn the
- * socket closed, so a turn parked on a gate waits on a promise for a caller
- * who has already hung up: the waiter never settles and the console keeps
- * showing a gate for a call that ended. `close` on the response with nothing
- * finished is the socket going away, which on a phone line is the call
- * ending mid-sentence.
+ * `close` on the response with nothing finished is the socket going away,
+ * which on a phone line is the call ending mid-sentence. The endpoint reads
+ * that off `req.signal` to refuse a turn for a caller who is already gone.
+ * It is not the only path: a Request's signal follows the controller passed
+ * to it and stopped firing once the request object was no longer referenced,
+ * so the dispatch below also cancels the response reader, which is what
+ * reliably reaches a turn already in flight.
  */
 function toRequest(req: IncomingMessage, res: ServerResponse, body: string): Request {
   const headers = new Headers();
@@ -356,7 +357,7 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       } finally {
         await reader.cancel().catch(() => {});
       }
-      res.end();
+      if (!res.writableEnded && !res.destroyed) res.end();
     })();
   });
 });
