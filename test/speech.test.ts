@@ -116,6 +116,14 @@ test('a leading zero in the cents is not read out', () => {
   assert.equal(speakNumbers('$8,764.05'), '8,764 dollars and 5 cents');
 });
 
+test('a fraction that is not cents is left exactly as it was', () => {
+  // Three decimals is not money. Rendering the first two as cents and leaving
+  // the third stranded would speak a different figure to the one on file, so
+  // an unexpected shape passes through untouched instead.
+  assert.equal(speakNumbers('$13,481.123'), '$13,481.123');
+  assert.equal(speakNumbers('$1.5'), '1 dollar and 50 cents');
+});
+
 test('a bare decimal is spoken as point, not as dot', () => {
   assert.equal(speakNumbers('The ratio is 78.6 percent.'), 'The ratio is 78 point 6 percent.');
 });

@@ -71,7 +71,7 @@ function couldBecomeFiller(text: string): boolean {
  * The grouped alternative is first so "$13,481" matches whole rather than
  * stopping at "$13".
  */
-const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?/g;
+const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
 
 /**
  * Rewrites figures into the words a TTS engine reads correctly.
@@ -82,7 +82,11 @@ const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?/g;
  */
 export function speakNumbers(text: string): string {
   return text
-    .replace(CURRENCY, (_match, whole: string, cents: string | undefined) => {
+    .replace(CURRENCY, (match: string, whole: string, cents: string | undefined) => {
+      // Money has at most two decimals. Anything longer is not a figure this
+      // knows how to say, and reading the first two digits as cents would put
+      // a different amount in the caller's ear, so it passes through as it is.
+      if (cents !== undefined && cents.length > 2) return match;
       const unit = whole.replace(/,/g, '') === '1' ? 'dollar' : 'dollars';
       if (cents === undefined) return `${whole} ${unit}`;
       // "12" is twelve cents, ".5" is fifty. Padding right rather than parsing
@@ -91,7 +95,10 @@ export function speakNumbers(text: string): string {
       if (count === 0) return `${whole} ${unit}`;
       return `${whole} ${unit} and ${count} ${count === 1 ? 'cent' : 'cents'}`;
     })
-    .replace(/(\d)\.(\d)/g, '$1 point $2');
+    // A decimal that still has a dollar sign in front of it is a money shape
+    // the rule above declined to touch, so this leaves it alone rather than
+    // half converting it.
+    .replace(/(?<!\$[\d,]*)(\d)\.(\d)/g, '$1 point $2');
 }
 
 /**
