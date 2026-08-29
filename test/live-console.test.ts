@@ -458,3 +458,46 @@ test('a second caller does not move the hold clock of the call on screen', () =>
   const holds = client.events().filter((e) => e.type === 'hold');
   assert.deepEqual(holds.map((h) => (h as { status: string }).status), ['started']);
 });
+
+test('a gate resolved before a client connects is replayed to it', () => {
+  const live = createLiveConsole();
+  live.emit({ type: 'call', status: 'started', claim_id: 'CLM-40218', caller: '+14155550142' });
+  live.emit({
+    type: 'gate', id: 'call_pfUm', tool: 'offer.state_settlement', status: 'opened',
+    wanted: 'Northvane can settle at 13,481 dollars and 12 cents.',
+  });
+  // The operator decides. The server broadcasts the outcome rather than
+  // letting the clicking console render its own, so a console opened after
+  // the click still sees what happened.
+  live.emit({
+    type: 'gate', id: 'call_pfUm', tool: 'offer.state_settlement', status: 'approved',
+    said: 'Northvane can settle at 13,481 dollars and 12 cents.',
+  });
+
+  const late = sink();
+  live.attach(late);
+
+  const gates = late.events().filter((e) => e.type === 'gate');
+  assert.equal(gates.length, 2, 'a late console could not tell what happened to the gate');
+  assert.equal((gates[1] as { status: string }).status, 'approved');
+});
+
+test('a hangup ends the call without unpinning the frame the header needs', () => {
+  const live = createLiveConsole({ bufferLimit: 2 });
+  live.emit({ type: 'call', status: 'started', claim_id: 'CLM-40218', caller: '+14155550142' });
+  live.emit({ type: 'hold', status: 'started' });
+  for (let i = 0; i < 6; i++) {
+    live.emit({ type: 'lane', name: `lane ${i}`, tool: `tool.${i}`, status: 'pending' });
+  }
+  // The caller hangs up while a gate is held.
+  live.emit({ type: 'call', status: 'ended', caller: '+14155550142' });
+
+  const late = sink();
+  live.attach(late);
+  const replayed = late.events();
+
+  const calls = replayed.filter((e) => e.type === 'call');
+  assert.equal(calls[0] && (calls[0] as { status: string }).status, 'started',
+    'the ended frame replaced the one a late client renders its header from');
+  assert.equal(calls.at(-1) && (calls.at(-1) as { status: string }).status, 'ended');
+});
