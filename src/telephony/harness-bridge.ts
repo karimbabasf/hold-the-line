@@ -8,6 +8,7 @@
  */
 
 import type { ConsoleEvent } from '../console/events.ts';
+import { TrueForgeError } from '../trueforge/client.ts';
 import { checkpoint, resume } from '../session/store.ts';
 import type { TrueForgeClient } from '../trueforge/client.ts';
 import {
@@ -114,6 +115,18 @@ function* speakOut(shaper: SpeechShaper, text: string): Generator<TurnDelta> {
   if (flushed) yield { type: 'message.delta', text: flushed };
   const spoken = shaper.push(text);
   if (spoken) yield { type: 'message.delta', text: spoken };
+}
+
+/**
+ * True when the harness says the session we asked to continue is gone.
+ *
+ * The harness is a local process and a restart takes every session with it,
+ * while the checkpoint on disk survives. So a stored id outliving its session
+ * is ordinary, not exceptional, and the first caller back after a restart
+ * must not hear the failure line because of it.
+ */
+export function isMissingSession(err: unknown): boolean {
+  return err instanceof TrueForgeError && err.status === 404;
 }
 
 export function createBridge(opts: BridgeOptions) {
@@ -512,7 +525,9 @@ export function createBridge(opts: BridgeOptions) {
       callerId: string,
       signal?: AbortSignal,
     ): AsyncGenerator<TurnDelta> {
-      const { id: sessionId, resumed, isNew } = await sessionFor(callerId);
+      const opened = await sessionFor(callerId);
+      let sessionId = opened.id;
+      const { resumed, isNew } = opened;
 
       // Emit console events for session lifecycle changes.
       if (isNew) {
@@ -590,14 +605,46 @@ export function createBridge(opts: BridgeOptions) {
       // a filler already said before the gate must not be said again after it.
       const shaper = createSpeechShaper();
 
-      yield* runGuarded(
-        sessionId,
-        [{ type: 'user.message', content }],
-        callerId,
-        0,
-        shaper,
-        signal,
-      );
+      // A resumed id can name a session the harness no longer has. Nothing
+      // has reached the caller at this point, so a fresh session and one more
+      // attempt costs the resume and never the call. Only before the first
+      // delta: retrying after speech would say part of the turn twice.
+      let spoke = false;
+      try {
+        for await (const delta of runGuarded(
+          sessionId,
+          [{ type: 'user.message', content }],
+          callerId,
+          0,
+          shaper,
+          signal,
+        )) {
+          spoke = true;
+          yield delta;
+        }
+      } catch (err) {
+        if (spoke || !resumed || !isMissingSession(err)) throw err;
+        console.warn(
+          `resumed session ${sessionId} is gone from the harness, starting a fresh one`,
+        );
+        sessions.delete(callerId);
+        sessionId = await opts.forge.createSession(opts.agentName);
+        remember(callerId, sessionId);
+        await checkpoint(callerId, {
+          harness_session_id: sessionId,
+          transcript_index: 0,
+        }).catch(() => {});
+        // The reconnect cue goes with the session that is gone. There is
+        // nothing to continue, so this is the caller's opening line.
+        yield* runGuarded(
+          sessionId,
+          [{ type: 'user.message', content: userText }],
+          callerId,
+          0,
+          shaper,
+          signal,
+        );
+      }
 
       const tail = shaper.end();
       if (tail) yield { type: 'message.delta', text: tail };

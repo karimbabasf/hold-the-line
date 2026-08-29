@@ -412,6 +412,34 @@
   .btn--send-back:hover { color: var(--text); border-color: var(--text-muted); }
   .btn--send-back.is-emphasised { color: var(--warning); border-color: var(--warning); }
 
+  .gate-held {
+    color: var(--warning);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .gate-reason-input, .gate-token-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: var(--sp-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-strong);
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    resize: vertical;
+  }
+  .gate-reason-input::placeholder, .gate-token-input::placeholder { color: var(--text-faint); }
+  .gate-reason-input:focus, .gate-token-input:focus { outline: 1px solid var(--computed); }
+
+  .gate-status { min-height: 16px; font-size: 12px; color: var(--text-muted); }
+  .gate-status--bad { color: var(--danger); }
+
+  .gate-token { display: flex; flex-direction: column; gap: var(--sp-1); margin-top: var(--sp-2); }
+  .gate-token-row { display: flex; gap: var(--sp-2); align-items: center; }
+  .gate-token-row .gate-token-input { flex: 1; }
+
   .gate-said { font-size: 16px; line-height: 1.55; margin: 0; }
   .gate-reason { margin: 0; color: var(--text-muted); font-size: 12.5px; }
 
