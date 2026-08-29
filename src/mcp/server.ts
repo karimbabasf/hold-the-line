@@ -142,6 +142,33 @@ const messageOf = (error: unknown): string =>
  * already funnels through here, so a sixteenth tool costs nothing to
  * instrument and cannot be forgotten.
  */
+/**
+ * Reports a tool call on the `tool` wire only, never on `lane`.
+ *
+ * For work that genuinely happened but must not enter the fan-out counter.
+ * `laneWindow` is deliberately untouched here: it is what the
+ * parallel-versus-serial figure is computed from, and a lookup that costs no
+ * hop of its own would inflate the serial side with time nobody waited.
+ */
+function openToolOnly(name: string): (result: unknown, error?: unknown) => void {
+  const gated = GATED_TOOLS_SET.has(name) ? ({ gated: true } as const) : {};
+  const startedAt = performance.now();
+  report({ type: 'tool', tool: name, status: 'pending', ...gated });
+
+  return (result: unknown, error?: unknown) => {
+    const summary =
+      error === undefined ? toolSummary(name, result) : clipSummary(messageOf(error));
+    report({
+      type: 'tool',
+      tool: name,
+      status: error === undefined ? 'done' : 'error',
+      elapsed_ms: millis(performance.now() - startedAt),
+      ...(summary ? { summary } : {}),
+      ...gated,
+    });
+  };
+}
+
 function openTool(name: string, runId: string): (result: unknown, error?: unknown) => void {
   const isLane = !CONTAINER_TOOLS.has(name);
   const laneName = laneNameFor(name);
@@ -390,9 +417,27 @@ export async function claimSnapshot(args: { claim_id: string }) {
   );
 
   const serial_ms = millis(timings.reduce((a, t) => a + t.elapsed_ms, 0));
+
+  // The policy is read here rather than through `lane()` on purpose: it needs
+  // no hop of its own and adding one would put a seventh row in a fan-out the
+  // summary calls six lookups, and inflate serial_ms with it. But the console
+  // draws a pipe per tool, and a dark `policy.lookup` while the agent is
+  // saying it has read the policy is the panel contradicting the call. So it
+  // reports as a tool and not as a lane: the pipe lights, the counter does
+  // not move.
+  const closePolicy = openToolOnly('policy.lookup');
+  let policy;
+  try {
+    policy = policyLookup({ phone: loadPolicy().phone });
+  } catch (err) {
+    closePolicy(undefined, err ?? new Error('policy.lookup failed'));
+    throw err;
+  }
+  closePolicy(policy);
+
   return {
     claim, vehicle, comps, payoff, storage, state_rules: rules,
-    policy: policyLookup({ phone: loadPolicy().phone }),
+    policy,
     lanes: timings,
     parallel_ms: millis(performance.now() - started),
     serial_ms,

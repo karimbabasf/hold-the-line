@@ -104,3 +104,21 @@ test('a tool that throws closes its pipe as an error, not as done', async () => 
   // plainly rather than repeating the word in front of it.
   assert.match(rows[1]?.summary ?? '', /no claim on file/);
 });
+
+test('the policy read inside a snapshot lights its pipe without moving the counter', async () => {
+  // `claimSnapshot` reads the policy directly rather than through `lane()`,
+  // because it costs no hop of its own. The console draws a pipe per tool, so
+  // a dark `policy.lookup` while the agent says it has read the policy is the
+  // panel contradicting the call.
+  const events = await run('claim.snapshot', { claim_id: '40218' });
+
+  const policyTools = toolFrames(events, 'policy.lookup');
+  assert.equal(policyTools.length, 2, 'policy.lookup never lit inside the snapshot');
+  assert.equal(policyTools[1]?.status, 'done');
+
+  // And it stayed out of the fan-out, which the summary calls six lookups.
+  const policyLanes = events.filter(
+    (e) => e.type === 'lane' && (e as { tool?: string }).tool === 'policy.lookup',
+  );
+  assert.equal(policyLanes.length, 0, 'the policy read entered the fan-out counter');
+});
