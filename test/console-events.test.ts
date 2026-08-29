@@ -35,9 +35,9 @@ test('a frame split across a data field with an embedded newline stays one event
   // Per the SSE spec, repeated `data:` lines within one frame join with a
   // newline. JSON.stringify never emits raw newlines, but this proves the
   // decoder does not require it to.
-  const wire = 'event: number\nid: 1\ndata: {"type":"number",\ndata: "t":1,"label":"x","value":1}\n\n';
+  const wire = 'event: number\nid: 1\ndata: {"type":"number",\ndata: "t":1,"label":"x","value":1,"spoken":true}\n\n';
   const [decoded] = parseSSE(wire);
-  assert.deepEqual(decoded, { type: 'number', t: 1, label: 'x', value: 1 });
+  assert.deepEqual(decoded, { type: 'number', t: 1, label: 'x', value: 1, spoken: true });
 });
 
 test('drops a block with no data field rather than throwing', () => {
@@ -56,6 +56,30 @@ test('the type guard accepts only known event types with a numeric t', () => {
   assert.equal(isConsoleEvent({ type: 'hold', t: '0' }), false);
   assert.equal(isConsoleEvent(null), false);
   assert.equal(isConsoleEvent('hold'), false);
+});
+
+test('the type guard checks each subtype status, not only the envelope', () => {
+  // A gate with an unrecognised status must not be mistaken for 'approved'
+  // by anything downstream, so it has to be rejected here, at the one
+  // place untrusted input is supposed to stop.
+  assert.equal(isConsoleEvent({ type: 'gate', t: 0, id: 'g', tool: 'offer.state_settlement', status: 'bogus' }), false);
+  assert.equal(isConsoleEvent({ type: 'gate', t: 0, id: 'g', tool: 'offer.state_settlement', status: 'approved' }), true);
+  assert.equal(isConsoleEvent({ type: 'call', t: 0, status: 'sideways' }), false);
+});
+
+test('the type guard requires the fields each subtype needs to render safely', () => {
+  // A session missing session_id would otherwise reach onSession and crash
+  // on session_id.toUpperCase(). A gate missing tool or id, or a number
+  // missing spoken, are the same shape of failure elsewhere in the console.
+  assert.equal(isConsoleEvent({ type: 'session', t: 0, status: 'suspended' }), false);
+  assert.equal(isConsoleEvent({ type: 'session', t: 0, status: 'suspended', session_id: 's' }), true);
+  assert.equal(isConsoleEvent({ type: 'gate', t: 0, status: 'opened', tool: 'offer.state_settlement' }), false);
+  assert.equal(isConsoleEvent({ type: 'gate', t: 0, status: 'opened', id: 'g' }), false);
+  assert.equal(isConsoleEvent({ type: 'number', t: 0, label: 'x', value: 1 }), false);
+  assert.equal(isConsoleEvent({ type: 'number', t: 0, label: 'x', value: 1, spoken: true }), true);
+  assert.equal(isConsoleEvent({ type: 'number', t: 0, label: 'x', value: 1, spoken: true, from: 'guessed' }), false);
+  assert.equal(isConsoleEvent({ type: 'lane', t: 0, status: 'pending', name: 'x' }), false);
+  assert.equal(isConsoleEvent({ type: 'lanes_summary', t: 0, parallel_ms: 1 }), false);
 });
 
 test('parseSSE drops a decoded object that is not a console event', () => {

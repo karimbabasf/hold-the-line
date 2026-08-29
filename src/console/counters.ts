@@ -77,11 +77,16 @@ export function tallyUtterances(records: readonly UtteranceRecord[]): UtteranceT
 /** Every provenance-tagged number the console has received so far, in the
  *  shape `tally` expects. This is the run log read back, not a list
  *  maintained by hand: call it with whatever events arrived and the count
- *  moves with them. */
+ *  moves with them.
+ *
+ *  Filters to `spoken: true`. A `number` event can represent a figure the
+ *  agent is only holding, before it says anything, and counting those
+ *  toward "numbers spoken" would inflate the one counter this project
+ *  cannot afford to inflate. */
 export function numbersFromEvents(events: readonly ConsoleEvent[]): NumberProvenance[] {
   const out: NumberProvenance[] = [];
   for (const e of events) {
-    if (e.type === 'number') out.push({ value: e.value, from: e.from });
+    if (e.type === 'number' && e.spoken) out.push({ value: e.value, from: e.from });
   }
   return out;
 }

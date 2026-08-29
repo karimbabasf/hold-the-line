@@ -140,8 +140,14 @@ function currentHoldMs(): number {
   return holdAccumulatedMs + (virtualNow() - holdStartedAtCallTime);
 }
 
+/** Set once `call.ended` arrives, so the header clock holds the call's
+ *  actual duration instead of counting up forever after the last scheduled
+ *  event, which `virtualNow()` has no reason to stop advancing past on its
+ *  own. */
+let callEndedAtCallTime: number | null = null;
+
 function tickClocks(): void {
-  el('call-clock').textContent = formatClock(virtualNow());
+  el('call-clock').textContent = formatClock(callEndedAtCallTime ?? virtualNow());
   el('hold-clock').textContent = formatClock(currentHoldMs());
 }
 
@@ -307,6 +313,7 @@ function renderGateOpen(gate: GateState): void {
 
   const btnApprove = h('button', { class: 'btn btn--approve' }, ['Approve']);
   const btnApproveEdits = h('button', { class: 'btn btn--approve-edits is-inactive' }, ['Approve with edits']);
+  btnApproveEdits.disabled = true;
   const btnSendBack = h('button', { class: 'btn btn--send-back' }, ['Send back to recompute']);
   content.appendChild(h('div', { class: 'gate-buttons' }, [btnApprove, btnApproveEdits, btnSendBack]));
 
@@ -322,8 +329,18 @@ function renderGateOpen(gate: GateState): void {
     renderDiff();
     const unedited = textarea.value === gate.wanted;
     const empty = textarea.value.trim() === '';
-    btnApprove.classList.toggle('is-inactive', !unedited || empty);
-    btnApproveEdits.classList.toggle('is-inactive', unedited || empty);
+    const approveInactive = !unedited || empty;
+    const editsInactive = unedited || empty;
+    // The class drives the fade; `disabled` is what actually matters. A
+    // button hidden only by opacity and pointer-events is still in the tab
+    // order and still fires on Enter or Space, so an operator tabbing
+    // through the gate could invoke the plain "Approve" path on an edited
+    // draft, or "Approve with edits" before anything was edited. Setting
+    // `disabled` closes both: out of the tab order, and inert to any input.
+    btnApprove.classList.toggle('is-inactive', approveInactive);
+    btnApprove.disabled = approveInactive;
+    btnApproveEdits.classList.toggle('is-inactive', editsInactive);
+    btnApproveEdits.disabled = editsInactive;
     // An emptied draft cannot be approved by either path: there is nothing
     // left to speak, and a blank binding utterance is not a smaller version
     // of the offer, it is a different failure than the one this button row
@@ -331,13 +348,13 @@ function renderGateOpen(gate: GateState): void {
     btnSendBack.classList.toggle('is-emphasised', empty);
   });
 
-  // This is a replay of a recorded call, not a live backend: these buttons
-  // update the console's own display immediately (so the console is
-  // interactive for a demo, and so a judge can click "approve" and see it
-  // change), while the fixture's own scripted gate.sent_back / gate.approved
-  // events still arrive on their recorded schedule and simply confirm the
-  // same state a moment later. `?live=1` replaces this with a real POST to
-  // the emitter once one exists; the event shape it should send back is the
+  // This is a replay of a recorded call, not a live backend, so these
+  // buttons resolve the gate locally rather than posting anywhere. If the
+  // operator acts before the fixture's own scripted resolution for this id
+  // would have fired, theirs wins and the later scripted one is dropped
+  // (see `gateResolutions` on `dispatch`); acting after it is a no-op, the
+  // id is already resolved. `?live=1` replaces this with a real POST to the
+  // emitter once one exists; the event shape it should send back is the
   // same `GateEvent` this file already knows how to render.
   btnApprove.addEventListener('click', () => resolveGateLocally(gate, textarea.value));
   btnApproveEdits.addEventListener('click', () => resolveGateLocally(gate, textarea.value));
@@ -370,16 +387,24 @@ function logGateHistory(t: number, id: string, label: string): void {
   el('gate-history').appendChild(h('li', { class: 'gate-history-row mono' }, [`${formatClock(t)}  ${id}  ${label}`]));
 }
 
+/**
+ * An operator's click becomes a real `GateEvent` through the same
+ * `dispatch()` every wire or fixture event goes through, rather than
+ * rendering directly. That keeps exactly one code path deciding what a
+ * gate's outcome is, so a locally approved gate cannot be reopened or
+ * reversed by a scripted event arriving after it (see `gateResolutions` on
+ * `dispatch`), and the run log the counters read from always includes the
+ * operator's own decisions.
+ */
 function resolveGateLocally(gate: GateState, said: string): void {
-  renderGateApproved({ type: 'gate', t: virtualNow(), id: gate.id, tool: gate.tool, status: 'approved', said });
-  logGateHistory(virtualNow(), gate.id, 'approved (operator)');
-  if (currentGate?.id === gate.id) currentGate = null;
+  dispatch({ type: 'gate', t: virtualNow(), id: gate.id, tool: gate.tool, status: 'approved', said });
 }
 
 function sendBackLocally(gate: GateState): void {
-  renderGateAwaiting('Sent back to recompute. Waiting on the agent.');
-  logGateHistory(virtualNow(), gate.id, 'sent back (operator)');
-  if (currentGate?.id === gate.id) currentGate = null;
+  dispatch({
+    type: 'gate', t: virtualNow(), id: gate.id, tool: gate.tool, status: 'sent_back',
+    reason: 'sent back to recompute (operator)',
+  });
 }
 
 function onGate(ev: GateEvent): void {
@@ -427,6 +452,7 @@ function onCall(ev: CallEvent): void {
   pill.textContent = 'CALL ENDED, COUNTERS HELD';
   pill.className = 'pill pill--ended';
   el('counters').classList.add('counters--final');
+  callEndedAtCallTime = ev.t;
 }
 
 function onSession(ev: SessionEvent): void {
@@ -462,7 +488,20 @@ interface ConsoleState {
 
 const state: ConsoleState = { events: [] };
 
+/** The status a gate id first resolved to, `'sent_back'` or `'approved'`.
+ *  Once set it is final: whichever resolution reaches `dispatch()` first,
+ *  an operator's click or the fixture's own scripted timeline, wins, and
+ *  anything that would resolve the same id again is dropped rather than
+ *  rendered. Without this, a locally approved gate could be silently
+ *  reversed moments later by the fixture replaying its own scripted
+ *  outcome for the same id. */
+const gateResolutions = new Map<string, GateEvent['status']>();
+
 function dispatch(ev: ConsoleEvent): void {
+  if (ev.type === 'gate' && ev.status !== 'opened') {
+    if (gateResolutions.has(ev.id)) return;
+    gateResolutions.set(ev.id, ev.status);
+  }
   state.events.push(ev);
   switch (ev.type) {
     case 'call':
@@ -512,6 +551,20 @@ function startReplay(events: ConsoleEvent[], speed: number, until: number | null
   }
 }
 
+/** Re-anchors `virtualNow()` to a live event's own call-relative `t` rather
+ *  than page-load time. Without this, connecting mid-call would show the
+ *  call and hold clocks counting from when the browser tab opened instead
+ *  of from when the call was answered, since `playbackOrigin` is otherwise
+ *  only set by `startReplay()`. Re-anchoring on every event, not just the
+ *  first, also keeps the clock tracking the server rather than drifting
+ *  from it over a long call. */
+function syncClockToLive(t: number): void {
+  playbackOrigin = t;
+  playbackEpoch = Date.now();
+  playbackSpeed = 1;
+  playbackPaused = false;
+}
+
 function startLive(url: string): void {
   const source = new EventSource(url);
   const onMessage = (msgEvent: MessageEvent): void => {
@@ -521,7 +574,9 @@ function startLive(url: string): void {
     } catch {
       return;
     }
-    if (isConsoleEvent(parsed)) dispatch(parsed);
+    if (!isConsoleEvent(parsed)) return;
+    syncClockToLive(parsed.t);
+    dispatch(parsed);
   };
   const types: ConsoleEvent['type'][] = ['lane', 'lanes_summary', 'number', 'gate', 'hold', 'session', 'call'];
   for (const type of types) source.addEventListener(type, onMessage);

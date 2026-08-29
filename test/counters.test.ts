@@ -9,7 +9,7 @@ import {
   tallyUtterances,
   utterancesFromEvents,
 } from '../src/console/counters.ts';
-import { recordedNorthvaneCall } from '../src/console/events.ts';
+import { recordedNorthvaneCall, type ConsoleEvent } from '../src/console/events.ts';
 
 test('counts spoken numbers by provenance, never claiming all are computed', () => {
   const t = tally([{ value: 21340.0, from: 'computed' }, { value: 1000.0, from: 'record' }]);
@@ -60,6 +60,17 @@ test('a sent-back draft is absent from the tally, not a near miss', () => {
   // Nothing was said, so it is not "spoken and unapproved" either: it never
   // reached the caller at all.
   assert.deepEqual(tallyUtterances([]), { binding: 0, approved: 0, spokenUnapproved: 0 });
+});
+
+test('a held-but-unspoken number does not inflate the spoken count', () => {
+  // number events can represent a figure the agent is only holding, before
+  // it says anything. Counting those toward "numbers spoken" would be
+  // exactly the overclaim the counter exists to prevent.
+  const events: ConsoleEvent[] = [
+    { type: 'number', t: 0, label: 'held', value: 1, from: 'computed', run_id: 'run-1', spoken: false },
+    { type: 'number', t: 1, label: 'said', value: 2, from: 'record', source: 'x.y', spoken: true },
+  ];
+  assert.deepEqual(tally(numbersFromEvents(events)), { spoken: 1, computed: 0, record: 1, recalled: 0 });
 });
 
 test('the recorded Northvane call reconciles to the spec\'s own tally', () => {

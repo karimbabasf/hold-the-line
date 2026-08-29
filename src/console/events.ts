@@ -107,6 +107,15 @@ export interface NumberEvent {
   /** Present when `from` is `'record'`, e.g. "policy.deductible_collision". */
   source?: string;
   unit?: 'usd' | 'percent' | 'days';
+  /**
+   * True once this figure has actually been said to the caller, false while
+   * the agent is only holding it (for instance, the moment a lane result
+   * lands, before it is spoken). The Computed pane renders every `number`
+   * event either way, but the "numbers spoken" counter counts only the
+   * `spoken: true` ones: a held-but-unspoken value inflating that count
+   * would be exactly the kind of overclaim the counter exists to prevent.
+   */
+  spoken: boolean;
 }
 
 export interface GateEvent {
@@ -173,25 +182,57 @@ export type ConsoleEvent =
   | SessionEvent
   | CallEvent;
 
-const EVENT_TYPES: ReadonlySet<string> = new Set([
-  'lane',
-  'lanes_summary',
-  'number',
-  'gate',
-  'hold',
-  'session',
-  'call',
-]);
+const STATUS_SETS: Record<string, ReadonlySet<string> | undefined> = {
+  lane: new Set(['pending', 'done']),
+  gate: new Set(['opened', 'sent_back', 'approved']),
+  hold: new Set(['started', 'stopped']),
+  session: new Set(['suspended', 'resumed']),
+  call: new Set(['started', 'ended']),
+};
 
-/** Runtime guard for anything decoded off the wire before it is trusted. */
+/**
+ * Runtime guard for anything decoded off the wire before it is trusted.
+ *
+ * Checking only `type` and `t` would let a malformed live payload, a gate
+ * with `status: "bogus"` or a session missing `session_id`, reach code that
+ * assumes the full subtype and either misreads it (an unrecognised gate
+ * status is not the same as `'approved'`, but nothing else in the union
+ * means "harmless") or throws deep in a render function. Each variant's
+ * required fields are checked here instead, once, so nothing downstream has
+ * to re-derive what "valid" means for its own branch.
+ */
 export function isConsoleEvent(value: unknown): value is ConsoleEvent {
   if (typeof value !== 'object' || value === null) return false;
   const v = value as Record<string, unknown>;
-  return (
-    typeof v['type'] === 'string' &&
-    EVENT_TYPES.has(v['type']) &&
-    typeof v['t'] === 'number'
-  );
+  const { type } = v;
+  if (typeof type !== 'string' || typeof v['t'] !== 'number') return false;
+
+  const statuses = STATUS_SETS[type];
+  if (statuses && (typeof v['status'] !== 'string' || !statuses.has(v['status']))) return false;
+
+  switch (type) {
+    case 'lane':
+      return typeof v['name'] === 'string' && typeof v['tool'] === 'string';
+    case 'lanes_summary':
+      return typeof v['parallel_ms'] === 'number' && typeof v['serial_ms'] === 'number';
+    case 'number':
+      return (
+        typeof v['label'] === 'string' &&
+        typeof v['value'] === 'number' &&
+        typeof v['spoken'] === 'boolean' &&
+        (v['from'] === undefined || v['from'] === 'computed' || v['from'] === 'record')
+      );
+    case 'gate':
+      return typeof v['id'] === 'string' && typeof v['tool'] === 'string';
+    case 'hold':
+      return true;
+    case 'session':
+      return typeof v['session_id'] === 'string';
+    case 'call':
+      return true;
+    default:
+      return false;
+  }
 }
 
 let seqCounter = 0;
@@ -344,25 +385,25 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
     { type: 'lanes_summary', t: 11_450, parallel_ms: 3_400, serial_ms: 11_100 },
 
     // 0:14, dead air filled with the first two lanes that landed.
-    { type: 'number', t: 14_000, label: 'Rental days remaining', value: 4, from: 'computed', run_id: RUN_RENTAL, unit: 'days' },
-    { type: 'number', t: 14_400, label: 'Yard storage rate', value: 75.0, from: 'record', source: 'claim.storage_per_day', unit: 'usd' },
+    { type: 'number', t: 14_000, label: 'Rental days remaining', value: 4, from: 'computed', run_id: RUN_RENTAL, unit: 'days', spoken: true },
+    { type: 'number', t: 14_400, label: 'Yard storage rate', value: 75.0, from: 'record', source: 'claim.storage_per_day', unit: 'usd', spoken: true },
 
     // 0:20-0:32, SANDBOX CALL 1: settle({ retain_salvage: false }).
-    { type: 'number', t: 32_000, label: 'Actual cash value', value: 21_340.0, from: 'computed', run_id: RUN_CASH, unit: 'usd' },
-    { type: 'number', t: 32_300, label: 'Repair estimate', value: 16_780.0, from: 'record', source: 'claim.repair_estimate', unit: 'usd' },
-    { type: 'number', t: 32_600, label: 'Loss ratio', value: 78.6, from: 'computed', run_id: RUN_CASH, unit: 'percent' },
-    { type: 'number', t: 32_900, label: 'Total loss threshold', value: 75, from: 'record', source: 'state_rules.total_loss_threshold_pct', unit: 'percent' },
+    { type: 'number', t: 32_000, label: 'Actual cash value', value: 21_340.0, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
+    { type: 'number', t: 32_300, label: 'Repair estimate', value: 16_780.0, from: 'record', source: 'claim.repair_estimate', unit: 'usd', spoken: true },
+    { type: 'number', t: 32_600, label: 'Loss ratio', value: 78.6, from: 'computed', run_id: RUN_CASH, unit: 'percent', spoken: true },
+    { type: 'number', t: 32_900, label: 'Total loss threshold', value: 75, from: 'record', source: 'state_rules.total_loss_threshold_pct', unit: 'percent', spoken: true },
 
     // 0:38, walking the net figure.
-    { type: 'number', t: 38_000, label: 'Sales tax', value: 1_835.24, from: 'computed', run_id: RUN_CASH, unit: 'usd' },
-    { type: 'number', t: 38_300, label: 'Collision deductible', value: 1_000.0, from: 'record', source: 'policy.deductible_collision', unit: 'usd' },
-    { type: 'number', t: 38_600, label: 'Net settlement, cash', value: 13_481.12, from: 'computed', run_id: RUN_CASH, unit: 'usd' },
+    { type: 'number', t: 38_000, label: 'Sales tax', value: 1_835.24, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
+    { type: 'number', t: 38_300, label: 'Collision deductible', value: 1_000.0, from: 'record', source: 'policy.deductible_collision', unit: 'usd', spoken: true },
+    { type: 'number', t: 38_600, label: 'Net settlement, cash', value: 13_481.12, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
 
     // 0:45, THE PROOF BEAT. The caller's statement shows the principal
     // without the interest since; only the run can produce 8,764.12.
-    { type: 'number', t: 45_000, label: 'Lien per diem', value: 1.84, from: 'record', source: 'vehicle.lien.per_diem', unit: 'usd' },
-    { type: 'number', t: 45_300, label: 'Days of accrued interest', value: 35, from: 'computed', run_id: RUN_CASH, unit: 'days' },
-    { type: 'number', t: 45_600, label: 'Lienholder payoff', value: 8_764.12, from: 'computed', run_id: RUN_CASH, unit: 'usd' },
+    { type: 'number', t: 45_000, label: 'Lien per diem', value: 1.84, from: 'record', source: 'vehicle.lien.per_diem', unit: 'usd', spoken: true },
+    { type: 'number', t: 45_300, label: 'Days of accrued interest', value: 35, from: 'computed', run_id: RUN_CASH, unit: 'days', spoken: true },
+    { type: 'number', t: 45_600, label: 'Lienholder payoff', value: 8_764.12, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
 
     // 0:57, THE DROP. The hold clock stops: nobody is on hold on a dead line.
     { type: 'session', t: 57_000, status: 'suspended', session_id: SESSION_ID },
@@ -392,10 +433,10 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
     },
 
     // 1:30, SANDBOX CALL 2: settle({ retain_salvage: true }).
-    { type: 'number', t: 90_000, label: 'Net settlement, salvage retained', value: 9_180.12, from: 'computed', run_id: RUN_SALVAGE, unit: 'usd' },
+    { type: 'number', t: 90_000, label: 'Net settlement, salvage retained', value: 9_180.12, from: 'computed', run_id: RUN_SALVAGE, unit: 'usd', spoken: true },
 
     // 1:38, the amended draft with both options, and the second gate.
-    { type: 'number', t: 98_000, label: 'Offer validity', value: 30, from: 'record', source: 'state_rules.offer_validity_days', unit: 'days' },
+    { type: 'number', t: 98_000, label: 'Offer validity', value: 30, from: 'record', source: 'state_rules.offer_validity_days', unit: 'days', spoken: true },
     {
       type: 'gate', t: 98_000, id: 'gate-2', tool: 'offer.state_settlement', status: 'opened',
       wanted:
