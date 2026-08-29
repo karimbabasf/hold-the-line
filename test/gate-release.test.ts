@@ -72,7 +72,7 @@ before(async () => {
     sse: { attach: () => {}, detach: () => {} },
     gate: {
       pending: () => [...gate.gates.values()],
-      decide: (raw) => {
+      decide: async (raw) => {
         let body: { id?: unknown; status?: unknown; reason?: unknown };
         try {
           body = JSON.parse(raw);

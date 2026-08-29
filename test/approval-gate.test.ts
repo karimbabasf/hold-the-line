@@ -736,6 +736,98 @@ test('a gate that is not about money does not promise a figure', async () => {
   });
 });
 
+test('an approval is never contradicted by a line that beat it', async () => {
+  // Captured on the deployed stack: the operator approved at 28.0s and the
+  // caller was told at 29.7s that the file "still needs operator approval".
+  // The holding line had already gone out and nothing re-checked the gate.
+  await withStore(async () => {
+    const forge = stubForge({
+      turns: [
+        [message(LIVE_SOURCE_EVENT.id), LIVE_APPROVAL as unknown as TurnEvent, done()],
+        [message('m2'), delta('m2', 'We can settle this claim for $13,481.12.'), done()],
+      ],
+    });
+    const bridge = createBridge({
+      forge: forge.client,
+      agentName: 'northvane',
+      // Slow enough that the quiet timer fires first.
+      awaitApproval: async () => {
+        await new Promise((r) => setTimeout(r, 2200));
+        return { status: 'allow' };
+      },
+    });
+    const said = await speak(bridge.runTurn('is it totaled', CALLER));
+
+    // The approved wording is what the caller ends on, never the holding line.
+    assert.match(said, /13,481 dollars and 12 cents/, 'the approved sentence was never spoken');
+    assert.ok(
+      said.trimEnd().endsWith('cents.'),
+      `the turn ended on something other than the approved sentence: ${said}`,
+    );
+    assert.ok(
+      said.indexOf('confirmed with the adjuster') < said.search(/13,481 dollars/),
+      'the holding line came after the approval it contradicts',
+    );
+  });
+});
+
+test('a figure is never speakable without an approval anywhere in the call', async () => {
+  // The turn-2 question: a later turn spoke the figure with no gate of its
+  // own. That is only legitimate because an operator allowed it earlier in
+  // the same call. With no approval anywhere, no turn may say it.
+  await withStore(async () => {
+    const calculates = [
+      message('m1'),
+      SETTLEMENT_RESPONSE as unknown as TurnEvent,
+      message('m2'),
+      delta('m2', 'Let me run the numbers.'),
+      done(),
+    ];
+    const statesIt = [
+      message('m1'),
+      delta('m1', 'The payout comes to $13,481.12.'),
+      done(),
+    ];
+    const forge = stubForge({ turns: [calculates, statesIt, statesIt, statesIt, statesIt] });
+    const bridge = createBridge({ forge: forge.client, agentName: 'northvane' });
+
+    await speak(bridge.runTurn('my claim is CLM-40218', CALLER));
+    const second = await speak(bridge.runTurn('what is the payout', CALLER));
+    const third = await speak(bridge.runTurn('so how much', CALLER));
+
+    assert.doesNotMatch(second, /13[,.]481/, 'the guard failed open on turn 2');
+    assert.doesNotMatch(third, /13[,.]481/, 'the guard failed open on turn 3');
+  });
+});
+
+test('an operator allow is the only thing that authorises an amount', async () => {
+  // One write path, and it is behind an explicit human allow. A denial
+  // authorises nothing.
+  await withStore(async () => {
+    const gated = [
+      message('m1'),
+      // The figure has to be known before anything about it can be held.
+      SETTLEMENT_RESPONSE as unknown as TurnEvent,
+      message(LIVE_SOURCE_EVENT.id),
+      LIVE_APPROVAL as unknown as TurnEvent,
+      done(),
+    ];
+    const statesIt = [
+      message('m2'),
+      delta('m2', 'The payout comes to $13,481.12.'),
+      done(),
+    ];
+    const forge = stubForge({ turns: [gated, statesIt, statesIt, statesIt, statesIt] });
+    const bridge = createBridge({
+      forge: forge.client,
+      agentName: 'northvane',
+      awaitApproval: async () => ({ status: 'deny', reason: 'reword it' }),
+    });
+    const said = await speak(bridge.runTurn('what is the payout', CALLER));
+    assert.doesNotMatch(said, /13[,.]481/, 'a denial authorised the amount');
+  });
+});
+
 test('the live approval event shape is recognised', () => {
   assert.equal(
     isApprovalRequired(LIVE_APPROVAL as unknown as TurnEvent),

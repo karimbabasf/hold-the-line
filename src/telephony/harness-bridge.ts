@@ -658,7 +658,15 @@ export function createBridge(opts: BridgeOptions) {
 
     // Settle every gate before acting on any of them, so an abandoned
     // waiter cannot outlive the turn that opened it.
-    const all = Promise.all(decisions);
+    // Tracked separately from the race so the line can be dropped in the gap
+    // between the timer firing and the words actually leaving. An operator
+    // who approves inside that gap used to get the caller told, 1.7 seconds
+    // after their click, that the file "still needs operator approval".
+    let alreadyDecided = false;
+    const all = Promise.all(decisions).then((d) => {
+      alreadyDecided = true;
+      return d;
+    });
 
     // Fill the wait. A gate that is open and waiting on a person is the one
     // moment where "getting this confirmed" is exactly true, and it is also
@@ -672,7 +680,8 @@ export function createBridge(opts: BridgeOptions) {
       }),
     ]);
     clearTimeout(quiet);
-    if (!spokeSoon) {
+    // Never claim an approval is outstanding once it is not.
+    if (!spokeSoon && !alreadyDecided) {
       yield* speakOut(shaper, state.line);
     }
 
