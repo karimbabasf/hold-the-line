@@ -7,7 +7,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
 import { GATED_TOOL_NAMES } from '../src/mcp/gated.ts';
-import { createHttpServer } from '../src/mcp/server.ts';
+import { createHttpServer, matchesGateSecret } from '../src/mcp/server.ts';
 
 /**
  * Exercises the real MCP wire protocol: an actual `@modelcontextprotocol/sdk`
@@ -231,4 +231,78 @@ test('the gate end to end: pending draft, operator edit, approve, tool returns t
 test('an unknown route 404s cleanly', async () => {
   const res = await fetch(`${baseUrl}/nope`);
   assert.equal(res.status, 404);
+});
+
+// Qodo found that every single-record SAFE lookup except valuation.comps
+// ignored its own identifier and always answered for the one fixture on
+// file, the same bug already fixed for lienholder.payoff_quote above. Each
+// now fails closed on a mismatch; these prove it over the real wire.
+test('policy.lookup, claim.get, vehicle.get, state_rules.get and yard.storage_status fail closed on an unknown identifier', async () => {
+  const client = await connectClient();
+  const cases: Array<{ name: string; arguments: Record<string, string> }> = [
+    { name: 'policy.lookup', arguments: { phone: '+10000000000' } },
+    { name: 'claim.get', arguments: { claim_id: 'CLM-WRONG' } },
+    { name: 'vehicle.get', arguments: { vin: 'WRONGVIN0000000' } },
+    { name: 'state_rules.get', arguments: { state: 'CA' } },
+    { name: 'yard.storage_status', arguments: { claim_id: 'CLM-WRONG' } },
+    { name: 'claims_history.get', arguments: { vin: 'WRONGVIN0000000' } },
+  ];
+  for (const c of cases) {
+    const result = await client.callTool(c);
+    assert.equal(result.isError, true, `${c.name} should fail closed on a mismatch`);
+  }
+  await client.close();
+});
+
+test('the same five tools still answer correctly for the real identifiers', async () => {
+  const client = await connectClient();
+  const policy = textOf(
+    await client.callTool({ name: 'policy.lookup', arguments: { phone: '+14155550142' } }),
+  ) as { policy_id: string };
+  assert.equal(policy.policy_id, 'NVM-4417-2288');
+
+  const claim = textOf(
+    await client.callTool({ name: 'claim.get', arguments: { claim_id: 'CLM-40218' } }),
+  ) as { claim_id: string };
+  assert.equal(claim.claim_id, 'CLM-40218');
+  await client.close();
+});
+
+// matchesGateSecret is dependency-injected (the secret is a parameter, not
+// read from process.env inside it) precisely so this is testable without
+// process-level tricks.
+test('matchesGateSecret allows anything when no secret is configured', () => {
+  assert.equal(matchesGateSecret(undefined, undefined), true);
+  assert.equal(matchesGateSecret('Bearer whatever', undefined), true);
+});
+
+test('matchesGateSecret requires an exact bearer match once a secret is configured', () => {
+  assert.equal(matchesGateSecret('Bearer s3cret', 's3cret'), true);
+  assert.equal(matchesGateSecret('bearer s3cret', 's3cret'), true);
+  assert.equal(matchesGateSecret('Bearer wrong', 's3cret'), false);
+  assert.equal(matchesGateSecret(undefined, 's3cret'), false);
+});
+
+test('the gate admin routes enforce gateSecret end to end over HTTP when one is configured', async () => {
+  const secured = createHttpServer({ gateSecret: 'test-only-secret' });
+  await new Promise<void>((resolve) => secured.listen(0, '127.0.0.1', resolve));
+  const { port } = secured.address() as AddressInfo;
+  const url = `http://127.0.0.1:${port}`;
+
+  try {
+    const noAuth = await fetch(`${url}/gate`);
+    assert.equal(noAuth.status, 401);
+
+    const wrongAuth = await fetch(`${url}/gate`, {
+      headers: { authorization: 'Bearer nope' },
+    });
+    assert.equal(wrongAuth.status, 401);
+
+    const rightAuth = await fetch(`${url}/gate`, {
+      headers: { authorization: 'Bearer test-only-secret' },
+    });
+    assert.equal(rightAuth.status, 200);
+  } finally {
+    await new Promise<void>((resolve) => secured.close(() => resolve()));
+  }
 });

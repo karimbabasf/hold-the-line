@@ -129,6 +129,39 @@ test('settlement.accept rejects an amount outside the last approved offer', () =
   );
 });
 
+test('an amount authorised for one claim cannot be accepted on a different claim', () => {
+  // Found by Qodo: authorisedAmounts used to be one flat, unkeyed list, so
+  // any claim could accept an amount approved for any other claim.
+  setPendingGate({ claim_id: 'CLM-A', wanted: 'offer a', authorised_amounts: [1000] });
+  approveGate('approved a');
+  offerStateSettlement({ claim_id: 'CLM-A', utterance: 'offer a', authorised_amounts: [1000] });
+
+  assert.throws(
+    () => settlementAccept({ claim_id: 'CLM-B', amount: 1000, option: 'cash' }),
+    /not one of the amounts authorised for claim CLM-B/,
+  );
+  // The claim it really was authorised for still works.
+  const accepted = settlementAccept({ claim_id: 'CLM-A', amount: 1000, option: 'cash' });
+  assert.equal(accepted.accepted, true);
+});
+
+test('offer.state_settlement returns the approved authorised_amounts, not whatever the live call argues for', () => {
+  // Found by Qodo: the response used to echo args.authorised_amounts (the
+  // live tool call's own argument) rather than the amounts the operator
+  // actually saw and approved in the draft. A model argument does not have
+  // to accurately restate what was approved.
+  setPendingGate({ claim_id: 'CLM-40218', wanted: 'offer', authorised_amounts: [13481.12, 9180.12] });
+  approveGate('approved');
+
+  const result = offerStateSettlement({
+    claim_id: 'CLM-40218',
+    utterance: 'offer',
+    // Deliberately different from what was approved.
+    authorised_amounts: [999999],
+  });
+  assert.deepEqual(result.authorised_amounts, [13481.12, 9180.12]);
+});
+
 test('payment.issue, salvage.release_vehicle and coverage.deny return attributable records', () => {
   const payment = paymentIssue({ claim_id: 'CLM-40218', amount: 13481.12, method: 'ACH' });
   assert.equal(payment.status, 'issued');

@@ -25,6 +25,17 @@
  * never falls back to the model's argument when no operator text is on
  * file: it throws. Silently trusting the raw argument at that point would
  * quietly reopen the exact bypass this whole file exists to close.
+ *
+ * Known scope limit, flagged rather than hidden: `draft` and `decision` are
+ * one module-global slot, matching a console with one draft box (spec
+ * section 1: one adjuster, one call at a time), not a per-claim map. Two
+ * claims pending at once would have the second `setPendingGate` overwrite
+ * the first. The failure mode is fail-closed, not fail-open: `takeApprovedText`
+ * checks `claim_id`, so an overwritten draft surfaces as "no approved text
+ * on file", never as one claim's approval being spoken for another. Before
+ * any concurrent-claim or multi-session use, this needs a proper
+ * claim-or-tool-call-id-keyed store; `authorisedAmountsByClaim` below is
+ * already keyed for exactly that reason.
  */
 
 const toCents = (dollars: number): number => Math.round(dollars * 100);
@@ -65,10 +76,13 @@ export interface GateDecision extends GateDraft {
 
 let draft: GateDraft | undefined;
 let decision: GateDecision | undefined;
-/** Amounts pre-authorised by the most recently completed offer. Persists
- *  past `decision` being consumed, so `settlement.accept` still has
- *  something to check against after the offer tool has returned. */
-let authorisedAmounts: number[] = [];
+/** Amounts pre-authorised by the most recently completed offer, keyed by
+ *  claim id. Persists past `decision` being consumed, so `settlement.accept`
+ *  still has something to check against after the offer tool has returned.
+ *  Keyed rather than a flat list: a flat list let an amount authorised for
+ *  one claim be accepted on any other claim, since only the amount was
+ *  checked. Found by Qodo on this PR. */
+const authorisedAmountsByClaim = new Map<string, number[]>();
 
 /**
  * Registers a draft the console (or, for the live proof, a driver script
@@ -105,18 +119,23 @@ export function approveGate(finalText: string): GateDecision {
  * Consumed exactly once by the `offer.state_settlement` handler. Throws
  * rather than falling back to the model's own argument when nothing has
  * been approved, which is the invariant this whole file exists to hold.
+ *
+ * Returns the approved `authorisedAmounts` from the decision itself, not
+ * from whatever the live tool call's own argument says: the call is not
+ * trusted to accurately restate what an operator actually approved. Found
+ * by Qodo on this PR.
  */
-function takeApprovedText(claimId: string): string {
+function takeApprovedText(claimId: string): { said: string; authorisedAmounts: number[] } {
   if (!decision || decision.claim_id !== claimId) {
     throw new Error(
       `offer.state_settlement: no approved text on file for claim ${claimId}. ` +
         'An operator must call approveGate with the final wording before this tool can return.',
     );
   }
-  const said = decision.said;
-  authorisedAmounts = decision.authorised_amounts;
+  const { said, authorised_amounts } = decision;
+  authorisedAmountsByClaim.set(claimId, authorised_amounts);
   decision = undefined;
-  return said;
+  return { said, authorisedAmounts: authorised_amounts };
 }
 
 export interface OfferArgs {
@@ -134,12 +153,14 @@ export interface OfferArgs {
 export function offerStateSettlement(
   args: OfferArgs,
 ): { claim_id: string; wanted: string; said: string; authorised_amounts: number[] } {
-  const said = takeApprovedText(args.claim_id);
+  const { said, authorisedAmounts } = takeApprovedText(args.claim_id);
   return {
     claim_id: args.claim_id,
     wanted: args.utterance,
     said,
-    authorised_amounts: args.authorised_amounts,
+    // From the approved decision (see takeApprovedText), not args: see the
+    // doc comment there for why the two can legitimately differ.
+    authorised_amounts: authorisedAmounts,
   };
 }
 
@@ -160,15 +181,12 @@ export interface AcceptArgs {
 export function settlementAccept(
   args: AcceptArgs,
 ): { claim_id: string; amount: number; option: string; accepted: true } {
-  if (!isPreAuthorised(args.amount, authorisedAmounts)) {
-    const known =
-      authorisedAmounts.length > 0
-        ? authorisedAmounts.map((a) => a.toFixed(2)).join(', ')
-        : 'none yet';
+  const authorised = authorisedAmountsByClaim.get(args.claim_id) ?? [];
+  if (!isPreAuthorised(args.amount, authorised)) {
+    const known = authorised.length > 0 ? authorised.map((a) => a.toFixed(2)).join(', ') : 'none yet';
     throw new Error(
-      `settlement.accept: ${args.amount.toFixed(2)} is not one of the amounts authorised by ` +
-        `the last approved offer (${known}). Re-fire offer.state_settlement with a sentence ` +
-        'covering this amount.',
+      `settlement.accept: ${args.amount.toFixed(2)} is not one of the amounts authorised for claim ` +
+        `${args.claim_id} (${known}). Re-fire offer.state_settlement with a sentence covering this amount.`,
     );
   }
   return { claim_id: args.claim_id, amount: args.amount, option: args.option, accepted: true };

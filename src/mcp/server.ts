@@ -18,6 +18,7 @@
  * importing this module (tests, or a future task) never opens 8792.
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { pathToFileURL } from 'node:url';
 
@@ -60,16 +61,34 @@ const toDollars = (cents: number): number => cents / 100;
 // tested without going through HTTP or the MCP wire protocol.
 // ---------------------------------------------------------------------------
 
-export function policyLookup(_args: { phone: string }) {
-  return loadPolicy();
+// A live run found lienholder.payoff_quote ignoring its loan_id and always
+// answering for the one lien on file (fixed below it, in this file). Qodo
+// then found the same shape of bug on every other single-record lookup
+// here: an unknown or mismatched identifier must fail closed rather than
+// silently disclosing the one record on file as if it matched.
+
+export function policyLookup(args: { phone: string }) {
+  const policy = loadPolicy();
+  if (args.phone !== policy.phone) {
+    throw new Error(`policy.lookup: no policy on file for phone "${args.phone}".`);
+  }
+  return policy;
 }
 
-export function claimGet(_args: { claim_id: string }) {
-  return loadClaim();
+export function claimGet(args: { claim_id: string }) {
+  const claim = loadClaim();
+  if (args.claim_id !== claim.claim_id) {
+    throw new Error(`claim.get: no claim on file with id "${args.claim_id}".`);
+  }
+  return claim;
 }
 
-export function vehicleGet(_args: { vin: string }) {
-  return loadVehicle();
+export function vehicleGet(args: { vin: string }) {
+  const vehicle = loadVehicle();
+  if (args.vin !== vehicle.vin) {
+    throw new Error(`vehicle.get: no vehicle on file with VIN "${args.vin}".`);
+  }
+  return vehicle;
 }
 
 export function valuationComps(args: { vin: string; zip?: string; radius?: number }) {
@@ -122,15 +141,25 @@ export function claimsHistoryGet(args: { vin: string }) {
   // vehicle.prior_damage, which is what the "prior damage and claim
   // history" lane (lanes.ts) is actually pulling.
   const vehicle = loadVehicle();
-  return { vin: args.vin, prior_claims: vehicle.vin === args.vin ? vehicle.prior_damage : [] };
+  if (args.vin !== vehicle.vin) {
+    throw new Error(`claims_history.get: no vehicle on file with VIN "${args.vin}".`);
+  }
+  return { vin: args.vin, prior_claims: vehicle.prior_damage };
 }
 
-export function stateRulesGet(_args: { state: string }) {
-  return loadStateRules();
+export function stateRulesGet(args: { state: string }) {
+  const rules = loadStateRules();
+  if (args.state !== rules.state) {
+    throw new Error(`state_rules.get: no rules on file for state "${args.state}".`);
+  }
+  return rules;
 }
 
-export function yardStorageStatus(_args: { claim_id: string }) {
+export function yardStorageStatus(args: { claim_id: string }) {
   const claim = loadClaim();
+  if (args.claim_id !== claim.claim_id) {
+    throw new Error(`yard.storage_status: no claim on file with id "${args.claim_id}".`);
+  }
   const days = daysBetween(claim.storage_start, claim.quote_date);
   const accruedCents = toCents(claim.storage_per_day) * days;
   return {
@@ -417,9 +446,23 @@ async function connectForOneRequest(): Promise<WebStandardStreamableHTTPServerTr
   return transport;
 }
 
+/** A tool call or a gate decision is at most a few KB of text. 256KB is
+ *  generous and stops an unbounded read from being an easy way to exhaust
+ *  process memory on a listener with no auth in front of it. Found by
+ *  Qodo: the previous version had no limit at all. */
+const MAX_BODY_BYTES = 256 * 1024;
+
 async function readRawBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req as AsyncIterable<Buffer>) chunks.push(chunk);
+  let received = 0;
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    received += chunk.length;
+    if (received > MAX_BODY_BYTES) {
+      req.destroy();
+      throw new Error('request body too large');
+    }
+    chunks.push(chunk);
+  }
   return Buffer.concat(chunks).toString('utf8');
 }
 
@@ -430,6 +473,26 @@ function parseJson(text: string): unknown {
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+/**
+ * True when `header` (an `Authorization` value) presents `configuredSecret`
+ * as a bearer token, or when no secret is configured at all.
+ *
+ * Pure and dependency-injected (the caller passes the secret in) rather
+ * than reading `process.env` directly, so the auth behaviour itself is
+ * unit-testable without process-level gymnastics; see
+ * createHttpServer's own `gateSecret` option.
+ */
+export function matchesGateSecret(
+  header: string | undefined,
+  configuredSecret: string | undefined,
+): boolean {
+  if (!configuredSecret) return true;
+  const presented = header?.replace(/^Bearer /i, '') ?? '';
+  const a = Buffer.from(presented);
+  const b = Buffer.from(configuredSecret);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /**
@@ -457,10 +520,37 @@ function toWebRequest(req: IncomingMessage, bodyText: string): Request {
 /**
  * Builds the HTTP server without binding a port, so tests can listen it on
  * an ephemeral port and importing this module never opens 8792 by itself.
+ *
+ * `gateSecret` guards the /gate/* admin routes (see matchesGateSecret);
+ * whoever can reach them decides what the agent speaks next, which is
+ * exactly the decision this project makes a human make. Defaults to
+ * `GATE_ADMIN_SECRET` from the environment rather than always requiring
+ * one, because the proof steps in the plan run this process with nothing
+ * else set: an unset secret keeps that working and logs why once, rather
+ * than silently downgrading security or breaking the documented local demo
+ * flow. Binding to loopback (the entrypoint below) closes the network
+ * attack surface regardless; this closes the local one, for whenever a
+ * console or another local process also reaches this port.
  */
-export function createHttpServer() {
+export function createHttpServer(options: { gateSecret?: string } = {}) {
+  const gateSecret = options.gateSecret ?? process.env.GATE_ADMIN_SECRET;
+  if (!gateSecret) {
+    console.warn(
+      'GATE_ADMIN_SECRET is not set: the /gate/* admin routes are unauthenticated. ' +
+        'Fine for this loopback-only demo process; set it before anything else on the ' +
+        'same machine should be untrusted to reach this port.',
+    );
+  }
+
   const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handle(req, res);
+    // A rejected body read (too large, or the socket dropping mid-read) is
+    // otherwise an unhandled rejection outside every route's own try/catch,
+    // since readRawBody runs before routing. Found by Qodo.
+    handle(req, res).catch((err: unknown) => {
+      console.error('request handling failed:', err);
+      if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
+      else res.destroy();
+    });
   });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -495,48 +585,56 @@ export function createHttpServer() {
     // Gate admin surface. Not part of the MCP protocol: this is how an
     // operator (a console, or the driver script that plays that role for
     // the live proof) tells this process what a human decided, out of
-    // band from TrueForge's own plain allow/deny. See gated.ts.
-    if (url === '/gate' && req.method === 'GET') {
-      sendJson(res, 200, pendingGate() ?? null);
-      return;
-    }
-
-    if (url === '/gate/pending' && req.method === 'POST') {
-      try {
-        const body = parseJson(bodyText) as Partial<GateDraft> | undefined;
-        if (
-          !body ||
-          typeof body.claim_id !== 'string' ||
-          typeof body.wanted !== 'string' ||
-          !Array.isArray(body.authorised_amounts)
-        ) {
-          sendJson(res, 400, { error: 'expected {claim_id, wanted, authorised_amounts}' });
-          return;
-        }
-        setPendingGate({
-          claim_id: body.claim_id,
-          wanted: body.wanted,
-          authorised_amounts: body.authorised_amounts,
-        });
-        sendJson(res, 200, pendingGate());
-      } catch (err) {
-        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    // band from TrueForge's own plain allow/deny. See gated.ts. Gated on
+    // gateSecret when one is configured (see matchesGateSecret).
+    if (url.startsWith('/gate')) {
+      if (!matchesGateSecret(req.headers.authorization, gateSecret)) {
+        sendJson(res, 401, { error: 'unauthorized' });
+        return;
       }
-      return;
-    }
 
-    if (url === '/gate/approve' && req.method === 'POST') {
-      try {
-        const body = parseJson(bodyText) as { text?: string } | undefined;
-        if (!body || typeof body.text !== 'string') {
-          sendJson(res, 400, { error: 'expected {text}' });
-          return;
-        }
-        sendJson(res, 200, approveGate(body.text));
-      } catch (err) {
-        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      if (url === '/gate' && req.method === 'GET') {
+        sendJson(res, 200, pendingGate() ?? null);
+        return;
       }
-      return;
+
+      if (url === '/gate/pending' && req.method === 'POST') {
+        try {
+          const body = parseJson(bodyText) as Partial<GateDraft> | undefined;
+          if (
+            !body ||
+            typeof body.claim_id !== 'string' ||
+            typeof body.wanted !== 'string' ||
+            !Array.isArray(body.authorised_amounts)
+          ) {
+            sendJson(res, 400, { error: 'expected {claim_id, wanted, authorised_amounts}' });
+            return;
+          }
+          setPendingGate({
+            claim_id: body.claim_id,
+            wanted: body.wanted,
+            authorised_amounts: body.authorised_amounts,
+          });
+          sendJson(res, 200, pendingGate());
+        } catch (err) {
+          sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+
+      if (url === '/gate/approve' && req.method === 'POST') {
+        try {
+          const body = parseJson(bodyText) as { text?: string } | undefined;
+          if (!body || typeof body.text !== 'string') {
+            sendJson(res, 400, { error: 'expected {text}' });
+            return;
+          }
+          sendJson(res, 200, approveGate(body.text));
+        } catch (err) {
+          sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
     }
 
     sendJson(res, 404, { error: 'not found' });
@@ -556,7 +654,13 @@ const DEFAULT_PORT = 8792;
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = Number(process.env.MCP_PORT ?? DEFAULT_PORT);
   const httpServer = createHttpServer();
-  httpServer.listen(port, () => {
+  // Loopback only. Qodo flagged the previous default (all interfaces) as
+  // letting any host on the network reach the gated tools and the gate
+  // admin routes directly, bypassing TrueForge's own approval gate
+  // entirely. TrueForge and this process are both local by design (the
+  // plan's hard constraint is "remote URL, not stdio", not "public"), so
+  // this loses nothing the demo needs.
+  httpServer.listen(port, '127.0.0.1', () => {
     console.log(`northvane MCP server on http://localhost:${port}/mcp`);
   });
 }
