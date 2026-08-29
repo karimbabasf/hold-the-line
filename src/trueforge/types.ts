@@ -139,6 +139,95 @@ export function resolveGate(
   };
 }
 
+/**
+ * Emitted when the agent asks the caller something through
+ * `ask_user_question` and parks the thread waiting for the answer.
+ *
+ * Captured live on 2026-08-29. The shape is the approval's shape exactly:
+ *
+ *   {"type":"tool.response_required","id":"01m1778vb9kn187m3kha9qqx2m",
+ *    "created_at":"2026-08-29T16:57:28.169Z","thread_id":"main",
+ *    "tool_calls":[{"id":"call_vqgE8dQFc9PqamUyPtVHMMtf",
+ *                   "source_event_id":"01m1778sk9jwsr0w2jj54tyc3y"}]}
+ *
+ * Two things follow from it, and both were live faults. The turn speaks NO
+ * text at all, so the question exists only inside the tool call and a caller
+ * hears silence. And while it is parked the API refuses an ordinary message:
+ *
+ *   422 {"error":{"message":"thread main: user message cannot be sent while
+ *        approvals or questions are pending"}}
+ *
+ * so the caller's answer came back as an error and the endpoint spoke its
+ * fallback line.
+ */
+export interface ToolResponseRequiredEvent {
+  type: 'tool.response_required';
+  id: string;
+  created_at: string;
+  thread_id: string;
+  tool_calls: ToolCallRef[];
+}
+
+/** A question the agent is waiting on, with the words to say out loud. */
+export interface PendingQuestion {
+  tool_call_id: string;
+  thread_id: string;
+  /** The sentence to ask the caller. Empty when the source event could not
+   *  be read, which is the one case where nothing can be asked. */
+  question: string;
+  /** Choices the agent offered, if any. Usually empty on a phone call. */
+  options: string[];
+}
+
+export function isQuestionRequired(e: TurnEvent): e is ToolResponseRequiredEvent {
+  if (e.type !== 'tool.response_required') return false;
+  const { thread_id: threadId, tool_calls: toolCalls } =
+    e as Partial<ToolResponseRequiredEvent>;
+  return (
+    typeof threadId === 'string' &&
+    threadId.length > 0 &&
+    Array.isArray(toolCalls) &&
+    toolCalls.every((c) => typeof c?.id === 'string' && c.id.length > 0)
+  );
+}
+
+/**
+ * Pulls the question text off the source event.
+ *
+ * Same envelope as a gated call and a different name inside it. The tool is
+ * `ask_user_question`, singular, and its `arguments` is a JSON string
+ * carrying `{question, options}` rather than the `{mcp_server, tool_name,
+ * input}` a `call_tool` carries.
+ */
+export function resolveQuestion(
+  ref: ToolCallRef,
+  threadId: string,
+  source: ModelMessageEvent | undefined,
+): PendingQuestion {
+  const base: PendingQuestion = {
+    tool_call_id: ref.id,
+    thread_id: threadId,
+    question: '',
+    options: [],
+  };
+  const call = (source?.tool_calls ?? []).find((c) => c.id === ref.id);
+  if (!call?.function?.arguments) return base;
+
+  let args: { question?: unknown; options?: unknown };
+  try {
+    args = JSON.parse(call.function.arguments) as typeof args;
+  } catch {
+    return base;
+  }
+  return {
+    ...base,
+    ...(typeof args.question === 'string' ? { question: args.question } : {}),
+    ...(Array.isArray(args.options)
+      ? { options: args.options.filter((o): o is string => typeof o === 'string') }
+      : {}),
+  };
+}
+
 /** Sent back to resume a turn that is parked on an approval. */
 export interface UserToolApprovalInput {
   type: 'user.tool_approval';
@@ -147,19 +236,39 @@ export interface UserToolApprovalInput {
   approval: ApprovalDecision;
 }
 
+/**
+ * Sent back to answer a parked question.
+ *
+ * The field is `content`. Verified live: `response`, `output`, `result` and
+ * `answers` are all rejected with "expected string, received undefined at
+ * input[0].content".
+ */
+export interface UserToolResponseInput {
+  type: 'user.tool_response';
+  thread_id: string;
+  tool_call_id: string;
+  content: string;
+}
+
 export interface UserMessageInput {
   type: 'user.message';
   content: string;
 }
 
-export type TurnInputItem = UserMessageInput | UserToolApprovalInput;
+export type TurnInputItem =
+  | UserMessageInput
+  | UserToolApprovalInput
+  | UserToolResponseInput;
 
 export interface UnknownEvent {
   type: string;
   [key: string]: unknown;
 }
 
-export type TurnEvent = ToolApprovalRequiredEvent | UnknownEvent;
+export type TurnEvent =
+  | ToolApprovalRequiredEvent
+  | ToolResponseRequiredEvent
+  | UnknownEvent;
 
 /**
  * Narrows to an approval event, checking the fields the caller then uses.

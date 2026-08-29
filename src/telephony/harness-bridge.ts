@@ -12,10 +12,14 @@ import { checkpoint, resume } from '../session/store.ts';
 import type { TrueForgeClient } from '../trueforge/client.ts';
 import {
   isApprovalRequired,
+  isQuestionRequired,
   resolveGate,
+  resolveQuestion,
   type ApprovalDecision,
   type ResolvedGate,
+  type PendingQuestion,
   type ToolApprovalRequiredEvent,
+  type ToolResponseRequiredEvent,
   type TurnInputItem,
 } from '../trueforge/types.ts';
 import { bindingAmountsFrom, unauthorisedAmounts } from './binding-amounts.ts';
@@ -252,6 +256,38 @@ export function createBridge(opts: BridgeOptions) {
     return found;
   }
 
+  /**
+   * A question the agent asked and is parked waiting on, per caller.
+   *
+   * It has to outlive the turn, unlike an approval. An approval is settled
+   * by an operator while the caller's stream is still open; a question is
+   * answered by the caller SPEAKING, which only reaches us as the next turn.
+   * So the parked call id is carried across turns and the next utterance
+   * goes back as its answer.
+   */
+  const questionByCaller = new Map<string, PendingQuestion>();
+
+  /**
+   * Checkpoints one completed turn.
+   *
+   * After every turn rather than on disconnect, because a dropped call gives
+   * no disconnect to hook. The line just stops.
+   *
+   * transcript_index counts TURNS. It previously incremented per streamed
+   * event, so one turn of opener plus deltas plus completion recorded as a
+   * dozen entries and the resume line pointed at the wrong place.
+   */
+  async function recordTurn(callerId: string, sessionId: string): Promise<void> {
+    turnsSeen.set(callerId, (turnsSeen.get(callerId) ?? 0) + 1);
+    await checkpoint(callerId, {
+      harness_session_id: sessionId,
+      transcript_index: turnsSeen.get(callerId) ?? 1,
+    }).catch((err: unknown) => {
+      // A failed checkpoint costs a resume, never the call in progress.
+      console.warn('checkpoint failed for this turn:', err);
+    });
+  }
+
   /** Starts a caller's amounts over. A new call has authorised nothing. */
   function forgetAmounts(callerId: string): void {
     amountsByCaller.delete(callerId);
@@ -314,9 +350,21 @@ export function createBridge(opts: BridgeOptions) {
      *  turn. Live it is always one, but silence is a bad way to find out
      *  that changed. */
     const pendingEvents: ToolApprovalRequiredEvent[] = [];
-    const pending = (): boolean => pendingEvents.length > 0;
+    /** A question the agent parked on. Locks speech the same way an approval
+     *  does, because whatever else the turn had to say is now behind it. */
+    let parkedQuestion: ToolResponseRequiredEvent | null = null;
+    const pending = (): boolean =>
+      pendingEvents.length > 0 || parkedQuestion !== null;
 
     for await (const event of opts.forge.streamTurn(sessionId, input)) {
+      if (isQuestionRequired(event)) {
+        parkedQuestion = event;
+        // Whatever was mid-message goes no further, same as a gate: the
+        // agent has stopped to ask, so the caller hears the question next.
+        buffer = '';
+        continue;
+      }
+
       if (isApprovalRequired(event)) {
         // Never auto-approved here. Auto-approving would defeat the entire
         // point of the project.
@@ -365,6 +413,33 @@ export function createBridge(opts: BridgeOptions) {
     if (!pending()) {
       const out = releasable(buffer);
       if (out) yield* speakOut(shaper, out);
+      return;
+    }
+
+    // A parked question with no approval beside it. Ask it out loud and
+    // remember it, so the caller's next utterance answers it rather than
+    // hitting the 422 an ordinary message gets while a thread is parked.
+    if (pendingEvents.length === 0 && parkedQuestion) {
+      const ref = parkedQuestion.tool_calls[0];
+      if (!ref) return;
+      const source = ref.source_event_id
+        ? await opts.forge.findEvent(sessionId, ref.source_event_id)
+        : undefined;
+      const question = resolveQuestion(ref, parkedQuestion.thread_id, source);
+      questionByCaller.set(callerId, question);
+
+      // The question is model-written text on its way to a caller's ear, so
+      // it goes through the same check as anything else the agent says.
+      if (question.question) {
+        const out = releasable(question.question);
+        if (out) yield* speakOut(shaper, out);
+      } else {
+        // Nothing to ask means nothing to say. Silence beats inventing a
+        // question the agent did not write.
+        console.error(
+          `[gate] parked on a question whose text could not be read: ${ref.id}`,
+        );
+      }
       return;
     }
 
@@ -435,8 +510,10 @@ export function createBridge(opts: BridgeOptions) {
 
       // Emit console events for session lifecycle changes.
       if (isNew) {
-        // A new call starts with nothing authorised, whoever rang last.
+        // A new call starts with nothing authorised, whoever rang last, and
+        // with no question outstanding from a call that is over.
         forgetAmounts(callerId);
+        questionByCaller.delete(callerId);
         callStartTimes.set(callerId, Date.now());
         opts.onConsoleEvent?.({
           type: 'call', t: 0, status: 'started', caller: callerId,
@@ -460,6 +537,37 @@ export function createBridge(opts: BridgeOptions) {
       // "welcome back, you were asking about the payoff" beat, and it is
       // consumed here so only the first turn after a reconnect carries it.
       const isReconnect = pendingResume.delete(callerId);
+
+      // A parked question takes the utterance as its answer. Sending an
+      // ordinary message instead is a 422, "user message cannot be sent
+      // while approvals or questions are pending", which reached the caller
+      // as the endpoint's error line. The answer goes in unprefixed even on
+      // a reconnect: the field is an answer to one question, not free prose,
+      // and a bracketed stage direction inside it is not what was asked for.
+      const parked = questionByCaller.get(callerId);
+      if (parked) {
+        questionByCaller.delete(callerId);
+        const shaper = createSpeechShaper();
+        yield* runGuarded(
+          sessionId,
+          [
+            {
+              type: 'user.tool_response',
+              thread_id: parked.thread_id,
+              tool_call_id: parked.tool_call_id,
+              content: userText,
+            },
+          ],
+          callerId,
+          0,
+          shaper,
+        );
+        const answeredTail = shaper.end();
+        if (answeredTail) yield { type: 'message.delta', text: answeredTail };
+        await recordTurn(callerId, sessionId);
+        return;
+      }
+
       const content = isReconnect
         ? `[the caller was disconnected and has rung back. Continue where you ` +
           `left off, naming the question that was open. Do not greet them again ` +
@@ -486,20 +594,7 @@ export function createBridge(opts: BridgeOptions) {
       const tail = shaper.end();
       if (tail) yield { type: 'message.delta', text: tail };
 
-      // Checkpoint after every turn rather than on disconnect, because a
-      // dropped call gives no disconnect to hook. The line just stops.
-      //
-      // transcript_index counts TURNS. It previously incremented per streamed
-      // event, so one turn of opener plus deltas plus completion recorded as
-      // a dozen entries and the resume line pointed at the wrong place.
-      turnsSeen.set(callerId, (turnsSeen.get(callerId) ?? 0) + 1);
-      await checkpoint(callerId, {
-        harness_session_id: sessionId,
-        transcript_index: turnsSeen.get(callerId) ?? 1,
-      }).catch((err: unknown) => {
-        // A failed checkpoint costs a resume, never the call in progress.
-        console.warn('checkpoint failed for this turn:', err);
-      });
+      await recordTurn(callerId, sessionId);
     },
   };
 }

@@ -280,10 +280,16 @@ function assertHomogeneousInput(input: TurnInputItem[]): void {
   if (input.length === 0) throw new Error('turn input must not be empty');
 
   const hasMessage = input.some((i) => i.type === 'user.message');
-  const hasApproval = input.some((i) => i.type === 'user.tool_approval');
-  if (hasMessage && hasApproval) {
+  const hasResume = input.some(
+    (i) => i.type === 'user.tool_approval' || i.type === 'user.tool_response',
+  );
+  if (hasMessage && hasResume) {
+    // The server rejects the mix with a 422 that does not say which item is
+    // wrong, and while a thread is parked it rejects a bare message too:
+    // "user message cannot be sent while approvals or questions are
+    // pending". Failing here keeps the reason attached to the mistake.
     throw new Error(
-      'turn input must not mix user messages with approval resumes',
+      'turn input must not mix user messages with approval or question resumes',
     );
   }
 }
