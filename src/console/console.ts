@@ -359,20 +359,50 @@ interface MoneyLine {
   detail?: string | undefined;
 }
 
-/** The settlement breakdown, once a gate has carried one. This is the
- *  version that reconciles: its lines sum to the figure above them. */
+/** The settlement breakdown, once a gate has carried one. */
 let statementLines: MoneyLine[] = [];
-/** The headline figure. Whatever the agent last worked out as the net. */
-let headline: { label: string; value: number } | null = null;
+/** The headline figure. Whatever the agent last worked out as the net,
+ *  carrying its own provenance: a net settlement with no source behind it
+ *  is exactly the figure that must not look authoritative. */
+let headline: MoneyLine | null = null;
 /** Everything spoken in dollars before a breakdown exists, so the panel is
  *  not empty for the first half of the call. */
-const dollarsSoFar: MoneyLine[] = [];
+let dollarsSoFar: MoneyLine[] = [];
+
+/**
+ * Money in whole cents.
+ *
+ * The reconciliation on screen is the claim this project makes, so it is
+ * checked in integers rather than trusted to float arithmetic: the cash
+ * breakdown sums through 21485.00, -640.00, 495.00, 1835.24, 70.00,
+ * -1000.00, -8764.12, and a float sum of those lands a fraction of a cent
+ * off 13481.12 often enough to matter.
+ */
+function sumCents(lines: readonly { value: number }[]): number {
+  let cents = 0;
+  for (const line of lines) cents += Math.round(line.value * 100);
+  return cents;
+}
+
+/** True when these lines actually add up to this figure. A total rule is
+ *  drawn only when this is true, never on the assumption that a breakdown
+ *  in hand belongs to the figure above it. */
+function reconciles(lines: readonly { value: number }[], total: number): boolean {
+  return lines.length > 0 && sumCents(lines) === Math.round(total * 100);
+}
 
 function statementRow(line: MoneyLine): HTMLLIElement {
   const unsourced = line.from === undefined;
   return h('li', { class: `stmt-row${unsourced ? ' stmt-row--unsourced' : ''}` }, [
     h('span', { class: 'stmt-label' }, [line.label]),
     h('span', { class: 'stmt-value mono' }, [formatUsd(line.value)]),
+  ]);
+}
+
+function totalRow(label: string, value: number): HTMLLIElement {
+  return h('li', { class: 'stmt-row stmt-row--total' }, [
+    h('span', { class: 'stmt-label' }, [label]),
+    h('span', { class: 'stmt-value mono' }, [formatUsd(value)]),
   ]);
 }
 
@@ -390,36 +420,42 @@ function renderMoney(): void {
 
   const children: Node[] = [];
   if (headline) {
-    children.push(h('div', { class: 'money-figure mono' }, [formatUsd(headline.value)]));
-    children.push(h('div', { class: 'money-caption' }, [headline.label]));
+    const unsourced = headline.from === undefined;
+    children.push(
+      h('div', { class: `money-figure mono${unsourced ? ' money-figure--unsourced' : ''}` }, [
+        formatUsd(headline.value),
+      ]),
+    );
+    children.push(
+      h('div', { class: `money-caption${unsourced ? ' money-caption--unsourced' : ''}` }, [
+        unsourced ? `${headline.label}, with nothing behind it. Do not say this figure.` : headline.label,
+      ]),
+    );
   } else {
     children.push(h('div', { class: 'money-figure money-figure--none' }, ['Still adding up']));
     children.push(h('div', { class: 'money-caption' }, ['These are the numbers so far.']));
   }
 
   const rows = lines.map(statementRow);
-  // A total rule is only honest under the breakdown, whose lines actually
-  // sum to the figure. The running list above it does not, so it does not
-  // get one.
-  if (statementLines.length > 0 && headline) {
-    rows.push(
-      h('li', { class: 'stmt-row stmt-row--total' }, [
-        h('span', { class: 'stmt-label' }, ['What we pay']),
-        h('span', { class: 'stmt-value mono' }, [formatUsd(headline.value)]),
-      ]),
-    );
-  }
+  // A total rule is drawn only when these lines genuinely add up to the
+  // figure above them. A breakdown from an earlier option, still in hand
+  // when a new net settlement lands, would otherwise be totalled as though
+  // it belonged to it, which is the one thing this panel must never do.
+  if (headline && reconciles(lines, headline.value)) rows.push(totalRow('What we pay', headline.value));
   children.push(h('ul', { class: 'statement' }, rows));
 
   // Provenance, kept and demoted. A viewer who wants the proof opens this;
-  // a viewer watching the call is not made to read it.
+  // a viewer watching the call is not made to read it. The headline is in
+  // here too: the figure the caller is actually offered is the last one that
+  // should be exempt from having to say where it came from.
+  const provLines = headline ? [headline, ...lines] : lines;
   children.push(
     h('details', { class: 'provenance' }, [
       h('summary', {}, ['Where each number came from']),
       h(
         'ul',
         { class: 'prov-list' },
-        lines.map((line) =>
+        provLines.map((line) =>
           h('li', { class: 'prov-row' }, [
             h('div', { class: 'prov-label' }, [line.label]),
             h('div', { class: 'prov-detail' }, [
@@ -437,7 +473,12 @@ function renderMoney(): void {
 function onNumber(ev: NumberEvent): void {
   activityOverride = null;
   if (/^net settlement/i.test(ev.label)) {
-    headline = { label: ev.label, value: ev.value };
+    headline = {
+      label: ev.label,
+      value: ev.value,
+      from: ev.from,
+      detail: ev.from === 'record' ? ev.source : ev.run_id,
+    };
     settlementKnown = true;
   } else if (ev.unit === 'usd') {
     dollarsSoFar.push({
@@ -617,6 +658,10 @@ function showGateLayer(): void {
     clearTimeout(gateDismissTimer);
     gateDismissTimer = null;
   }
+  // Nothing takes the screen over a call that has ended. A decision already
+  // in flight when the caller hangs up still resolves and still lands in the
+  // decision list; it just does not put a modal back over a dead line.
+  if (!callLive) return;
   el('gate-layer').hidden = false;
 }
 
@@ -696,14 +741,14 @@ function renderGateOpen(gate: GateState): void {
   const rows = gate.breakdown.map((line) =>
     statementRow({ label: line.label, value: line.value, from: line.from, detail: line.detail }),
   );
-  const total = gate.authorisedAmounts[0];
-  if (total !== undefined) {
-    rows.push(
-      h('li', { class: 'stmt-row stmt-row--total' }, [
-        h('span', { class: 'stmt-label' }, ['What we pay']),
-        h('span', { class: 'stmt-value mono' }, [formatUsd(total)]),
-      ]),
-    );
+  // The total is the sum of the lines shown, not the first pre-authorised
+  // amount. A draft that offers two options pre-authorises both, and the
+  // one the breakdown describes is not always the first: gate 2's salvage
+  // lines come to 9,180.12 while `authorised_amounts[0]` is 13,481.12, so
+  // reading position zero printed a reconciliation that was false on its
+  // face.
+  if (gate.breakdown.length > 0) {
+    rows.push(totalRow('These lines add up to', sumCents(gate.breakdown) / 100));
   }
   right.appendChild(h('ul', { class: 'statement' }, rows));
 
@@ -931,8 +976,53 @@ function onGate(ev: GateEvent): void {
 // ---------------------------------------------------------------------------
 // Call header and session banner.
 
+/**
+ * Everything one call put on the screen, cleared for the next one.
+ *
+ * A console left open on a live line takes a second call on the same page,
+ * and without this the new caller's screen opens on the previous caller's
+ * dialogue and the previous caller's offer, overwritten only piecemeal as
+ * new events happen to land on the same rows.
+ */
+function resetForNewCall(started: ConsoleEvent): void {
+  state.events.length = 0;
+  state.events.push(started);
+  gateResolutions.clear();
+
+  lanes.clear();
+  el('steps').replaceChildren();
+  el('together').hidden = true;
+  el('decisions').replaceChildren();
+
+  unfinished.clear();
+  el('transcript').replaceChildren(h('p', { class: 'transcript-empty' }, ['Nothing said yet.']));
+
+  statementLines = [];
+  dollarsSoFar = [];
+  headline = null;
+  settlementKnown = false;
+  activityOverride = null;
+
+  holdRunning = false;
+  holdAccumulatedMs = 0;
+  holdStartedAtCallTime = 0;
+
+  currentGate = null;
+  gateIsOpen = false;
+  gateOpenedAtCallTime = null;
+  gateHeldEl = null;
+  if (gateDismissTimer !== null) {
+    clearTimeout(gateDismissTimer);
+    gateDismissTimer = null;
+  }
+  el('gate-layer').hidden = true;
+
+  renderMoney();
+}
+
 function onCall(ev: CallEvent): void {
   if (ev.status === 'started') {
+    resetForNewCall(ev);
     callEverStarted = true;
     callLive = true;
     callEndedAtCallTime = null;
@@ -946,6 +1036,10 @@ function onCall(ev: CallEvent): void {
   callLive = false;
   gateIsOpen = false;
   callEndedAtCallTime = ev.t;
+  if (gateDismissTimer !== null) {
+    clearTimeout(gateDismissTimer);
+    gateDismissTimer = null;
+  }
   el('gate-layer').hidden = true;
   applyScreen();
 }
