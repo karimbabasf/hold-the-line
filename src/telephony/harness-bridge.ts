@@ -53,6 +53,16 @@ export interface BridgeOptions {
   /** Called with every console event the bridge emits (call start, session
    *  resume). The server broadcasts these to SSE clients. */
   onConsoleEvent?: (event: ConsoleEvent) => void;
+  /**
+   * Where the TrueForge UI is served, for the link on the `sandbox` events.
+   *
+   * Separate from the API base url the client holds, because this one goes
+   * in front of a person: `sandboxUrl` builds a page a judge opens in a
+   * browser, and it has to be typed the way a browser resolves it. The
+   * harness binds IPv6 only, so `localhost` and `[::1]` reach it and
+   * `127.0.0.1` does not.
+   */
+  harnessUrl?: string;
   /** How long after a disconnect a caller can ring back and continue the same
    *  conversation. Ten minutes: long enough for a dropped call and a walk to
    *  better signal, short enough that a stranger on a recycled number does
@@ -88,6 +98,77 @@ export function extractText(event: { type: string; [k: string]: unknown }): stri
  */
 export function isMessageStart(event: { type: string }): boolean {
   return event.type === 'model.message';
+}
+
+/** Where the TrueForge UI answers when nothing else says. */
+const DEFAULT_HARNESS_URL = 'http://localhost:8790';
+
+/**
+ * The page a person opens to watch one harness session.
+ *
+ * TrueForge has no per-sandbox page: verified on 2026-08-29 by enumerating
+ * its API, which exposes the container only as an id on `sandbox.created`
+ * and as `GET /api/v1/sessions/{id}/turns/{turn}/download-sandbox-file`, a
+ * file download rather than a view. So this is the session's own page in the
+ * TrueForge UI, which shows the turn that ran the code and its output.
+ *
+ * That route serves the SPA on `Accept: text/html` and a 404 JSON body to
+ * anything else, so a browser gets 200 and a bare `fetch` does not. A test
+ * that checks this link is live has to ask for HTML.
+ */
+export function sandboxUrl(sessionId: string, harnessUrl = DEFAULT_HARNESS_URL): string {
+  return `${harnessUrl.replace(/\/+$/, '')}/sessions/${encodeURIComponent(sessionId)}`;
+}
+
+/**
+ * The container id on a `sandbox.created` event, or null.
+ *
+ * Captured live on 2026-08-29. The harness emits this once per session, the
+ * first time the agent runs code, and it is the only event in the stream
+ * that names the container:
+ *
+ *   { type: 'sandbox.created', id: '01m17mw1xxk4b8aj9qzcp51tnk',
+ *     created_at: '2026-08-29T20:55:08.989Z', thread_id: null,
+ *     sandbox_id: 'v1:daytona:default.a05c9b35-16eb-4394-9f59-1401fa3befcb' }
+ *
+ * The provider behind it is Daytona: `GET /api/v1/settings/sandbox-providers`
+ * reports `{"type":"daytona","exec_timeout_ms":60000,...}`, and `sandbox_id`
+ * is that provider's own handle rather than something TrueForge mints.
+ */
+export function sandboxIdOf(event: { type: string }): string | null {
+  if (event.type !== 'sandbox.created') return null;
+  const id = (event as { sandbox_id?: unknown }).sandbox_id;
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+/**
+ * True for the `tool.response` of code that ran inside the container.
+ *
+ * TrueForge's own code-execution tool is named `exec`
+ * (`tool_info: { type: 'truefoundry-system', name: 'exec' }`), and only its
+ * responses have this shape. Captured live:
+ *
+ *   {"success":true,"response":{"exitCode":0,"result":"64.4\n"}}
+ *
+ * An MCP tool's response is that tool's own JSON (`settlement.calculate`
+ * returns `{is_total_loss, acv, ..., run_id}`) or a bare string, so neither
+ * is mistaken for a container run. Keeping them apart is the whole point:
+ * the console's container light has to be off when the container is off, or
+ * it is decoration rather than evidence.
+ */
+export function isSandboxRun(content: unknown): boolean {
+  let parsed: unknown = content;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return false;
+    }
+  }
+  if (typeof parsed !== 'object' || parsed === null) return false;
+  const response = (parsed as Record<string, unknown>)['response'];
+  if (typeof response !== 'object' || response === null) return false;
+  return typeof (response as Record<string, unknown>)['exitCode'] === 'number';
 }
 
 /**
@@ -269,6 +350,55 @@ export function createBridge(opts: BridgeOptions) {
   const sessions = new Map<string, string>();
   const MAX_LIVE_SESSIONS = 500;
   const resumeWindowMs = opts.resumeWindowMs ?? DEFAULT_RESUME_WINDOW_MS;
+  const harnessUrl = opts.harnessUrl ?? DEFAULT_HARNESS_URL;
+
+  /**
+   * The container behind each harness session.
+   *
+   * Keyed by session rather than by caller because that is what the harness
+   * keys it by: a resumed call continues the same session and therefore the
+   * same container, and a session the harness has lost takes its container
+   * with it.
+   *
+   * A session appears here the moment it is announced to the console, with
+   * no id, because `sandbox.created` does not arrive until the agent first
+   * runs code. Until then the console has a live link and no container id,
+   * which is the truth: nothing has been provisioned yet.
+   */
+  const sandboxIds = new Map<string, string | undefined>();
+
+  /**
+   * Emits one `sandbox` event for a session.
+   *
+   * Every status carries the url and whatever id is known, so a console that
+   * joined late, or reconnected mid-call, never has to have seen `attached`
+   * to render the panel.
+   */
+  function sandbox(
+    callerId: string,
+    sessionId: string,
+    status: 'attached' | 'running' | 'idle' | 'gone',
+    extra: { t?: number; label?: string; run_id?: string } = {},
+  ): void {
+    const id = sandboxIds.get(sessionId) ?? sessionId;
+    opts.onConsoleEvent?.({
+      type: 'sandbox',
+      t: extra.t ?? callT(callerId),
+      status,
+      url: sandboxUrl(sessionId, harnessUrl),
+      id,
+      ...(extra.label === undefined ? {} : { label: extra.label }),
+      ...(extra.run_id === undefined ? {} : { run_id: extra.run_id }),
+    });
+  }
+
+  /** Announces a session's container once, and never twice for the same
+   *  session however many turns or reconnects it goes on to serve. */
+  function attachSandbox(callerId: string, sessionId: string): void {
+    if (sandboxIds.has(sessionId)) return;
+    sandboxIds.set(sessionId, undefined);
+    sandbox(callerId, sessionId, 'attached');
+  }
 
   function remember(callerId: string, sessionId: string): void {
     sessions.delete(callerId);
@@ -276,7 +406,11 @@ export function createBridge(opts: BridgeOptions) {
     while (sessions.size > MAX_LIVE_SESSIONS) {
       const oldest = sessions.keys().next().value;
       if (oldest === undefined) break;
+      // The container entry goes with the session it belongs to, or the map
+      // becomes the slow leak this eviction exists to stop.
+      const evicted = sessions.get(oldest);
       sessions.delete(oldest);
+      if (evicted !== undefined) sandboxIds.delete(evicted);
     }
   }
 
@@ -509,7 +643,31 @@ export function createBridge(opts: BridgeOptions) {
     const pending = (): boolean =>
       pendingEvents.length > 0 || parkedQuestion !== null;
 
+    /**
+     * When the harness last said anything on this turn.
+     *
+     * This is what dates the container's `running` event, and it is an
+     * observation rather than a reading: see `sandbox` handling below for
+     * why the harness cannot be asked directly.
+     */
+    let lastEventAt = Date.now();
+
     for await (const event of opts.forge.streamTurn(sessionId, input, signal)) {
+      const arrivedAt = Date.now();
+      const quietMs = arrivedAt - lastEventAt;
+
+      // The container's id, the first time the agent runs code. Recorded
+      // before the gate checks below, because a session that has a container
+      // has one whether or not this turn is also parked on an approval.
+      const sandboxId = sandboxIdOf(event);
+      if (sandboxId) sandboxIds.set(sessionId, sandboxId);
+
+      // `sandbox.created` rides in the same flush as the `tool.response`
+      // that follows it, so letting it move the clock would close the quiet
+      // window a fraction of a millisecond before the run it measures is
+      // reported, and every container run would show as instant.
+      if (!sandboxId) lastEventAt = arrivedAt;
+
       if (isQuestionRequired(event)) {
         parkedQuestion = event;
         // Whatever was mid-message goes no further, same as a gate: the
@@ -541,10 +699,38 @@ export function createBridge(opts: BridgeOptions) {
       if (pending()) continue;
 
       if (event.type === 'tool.response') {
-        for (const amount of bindingAmountsFrom(
-          (event as { content?: unknown }).content,
-        )) {
+        const content = (event as { content?: unknown }).content;
+        for (const amount of bindingAmountsFrom(content)) {
           if (!binding.includes(amount)) binding.push(amount);
+        }
+
+        /*
+         * The container ran, and this is the first the harness says of it.
+         *
+         * TrueForge announces no start of execution. Measured on the wire on
+         * 2026-08-29: a turn that ran a 12 second sleep sent its prose
+         * deltas at 1.8s, then nothing at all for 14.5 seconds, then
+         * `sandbox.created` and this `tool.response` in the same
+         * millisecond, then `turn.done`. So the only window this bridge can
+         * see is the silence it just sat through, and `running` is dated
+         * back to the start of it rather than to now. That is an
+         * observation, not a reading off the harness: the gap also covers
+         * whatever the model was doing before it called `exec`, so it is the
+         * outside edge of the run, never shorter than the run itself.
+         *
+         * `run_id` is deliberately absent. The figures the console traces
+         * come from `settlement.calculate` on the MCP server, which mints
+         * its own run ids in a different process; a container run produces
+         * none, and inventing one would break the only thing `run_id` is
+         * for.
+         */
+        if (isSandboxRun(content)) {
+          const at = callT(callerId);
+          sandbox(callerId, sessionId, 'running', {
+            t: Math.max(0, at - quietMs),
+            label: 'exec',
+          });
+          sandbox(callerId, sessionId, 'idle', { t: at });
         }
         continue;
       }
@@ -754,6 +940,13 @@ export function createBridge(opts: BridgeOptions) {
         });
       }
 
+      // Announced as soon as the session exists rather than when the first
+      // container run happens, so the console has a live link from the start
+      // of the call. `sandbox.created` does not arrive until the agent runs
+      // code, and a link a judge can only open halfway through the call is
+      // not much of a link.
+      attachSandbox(callerId, sessionId);
+
       // The cue has to reach the agent, not just sit in a flag the endpoint
       // never reads. Prefixing the turn is what actually produces the
       // "welcome back, you were asking about the payoff" beat, and it is
@@ -852,9 +1045,16 @@ export function createBridge(opts: BridgeOptions) {
         console.warn(
           `resumed session ${sessionId} is gone from the harness, starting a fresh one`,
         );
+        // The container went with the session, so the link the console is
+        // showing points at a page the harness will not serve. Say so before
+        // the replacement session is announced, or the panel keeps a dead
+        // link and calls it attached.
+        sandbox(callerId, sessionId, 'gone');
+        sandboxIds.delete(sessionId);
         sessions.delete(callerId);
         sessionId = await opts.forge.createSession(opts.agentName);
         remember(callerId, sessionId);
+        attachSandbox(callerId, sessionId);
         await checkpoint(callerId, {
           harness_session_id: sessionId,
           transcript_index: 0,
