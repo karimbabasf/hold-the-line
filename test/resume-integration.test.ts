@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { checkpoint, resume } from '../src/session/store.ts';
 import { createBridge } from '../src/telephony/harness-bridge.ts';
 import type { TrueForgeClient } from '../src/trueforge/client.ts';
 import type { TurnEvent } from '../src/trueforge/types.ts';
@@ -28,16 +29,25 @@ function tempStore(): string {
 /** A harness stub that counts how many sessions were ever created. */
 function stubForge() {
   let created = 0;
+  const sent: string[] = [];
   const client = {
     async createSession() {
       created += 1;
       return `sess-${created}`;
     },
-    async *streamTurn(): AsyncGenerator<TurnEvent> {
+    async *streamTurn(
+      _sessionId: string,
+      input: Array<{ type: string; content?: string }>,
+    ): AsyncGenerator<TurnEvent> {
+      sent.push(input[0]?.content ?? '');
       yield { type: 'model.message.delta', content: 'ok' };
     },
   };
-  return { client: client as unknown as TrueForgeClient, sessionsCreated: () => created };
+  return {
+    client: client as unknown as TrueForgeClient,
+    sessionsCreated: () => created,
+    sent,
+  };
 }
 
 async function drain(gen: AsyncGenerator<{ text: string }>): Promise<void> {
@@ -62,7 +72,13 @@ test('a caller ringing back inside the window keeps the same harness session', a
 
     // Nothing was recreated: the same harness conversation was picked back up.
     assert.equal(forge.sessionsCreated(), 1, 'a second session means the resume did not fire');
-    assert.equal(second.wasResumed(CALLER), true);
+
+    // The cue has to REACH the agent. A flag nobody reads produces no beat.
+    assert.match(forge.sent[1] ?? '', /rung back/);
+    assert.match(forge.sent[1] ?? '', /sorry, i lost you/);
+    // And it is consumed, so a third turn is an ordinary one.
+    await drain(second.runTurn('what about the payoff', CALLER));
+    assert.doesNotMatch(forge.sent[2] ?? '', /rung back/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     delete process.env.SESSION_STORE_PATH;
@@ -88,7 +104,7 @@ test('a caller outside the window starts fresh', async () => {
     await drain(later.runTurn('hello?', CALLER));
 
     assert.equal(forge.sessionsCreated(), 2);
-    assert.equal(later.wasResumed(CALLER), false);
+    assert.doesNotMatch(forge.sent[1] ?? '', /rung back/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     delete process.env.SESSION_STORE_PATH;
@@ -114,15 +130,32 @@ test('a different caller never inherits somebody else s session', async () => {
 test('a checkpoint failure does not take the call down', async () => {
   const dir = tempStore();
   try {
-    // Point the store at a path that cannot be written.
-    process.env.SESSION_STORE_PATH = '/nonexistent-directory-htl/sessions.json';
+    // A hard-coded unwritable path is not reliable: writeStore creates its
+    // parent recursively and a privileged process can write anywhere, so the
+    // test would pass without ever exercising the failure. Qodo caught that.
+    // Making the store path a FILE means mkdir on its parent-as-directory
+    // genuinely fails, on any uid.
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'not a directory');
+    process.env.SESSION_STORE_PATH = join(blocker, 'sessions.json');
+
+    // Prove the precondition rather than assuming it. checkpoint() swallows
+    // the error by design, so the evidence that the write really failed is
+    // that nothing came back out.
+    await checkpoint(CALLER, { harness_session_id: 'should-not-persist' });
+    assert.equal(
+      await resume(CALLER, 60_000),
+      null,
+      'the store was writable, so this test proves nothing',
+    );
+
     const forge = stubForge();
     const bridge = createBridge({ forge: forge.client, agentName: 'northvane' });
 
     const said: string[] = [];
     for await (const d of bridge.runTurn('claim 40218', CALLER)) said.push(d.text);
 
-    // The caller still got their answer.
+    // The caller still got their answer despite every write failing.
     assert.deepEqual(said, ['ok']);
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -50,8 +50,27 @@ export function createBridge(opts: BridgeOptions) {
    * conversation instead of starting a new one. Task 6 replaces this map
    * with a disk-backed store that also survives the process.
    */
+  /**
+   * Live sessions, newest last, bounded.
+   *
+   * A phone line runs for months and every caller who ever rings adds an
+   * entry, so an unbounded map is a slow leak. The disk checkpoint is the
+   * real memory; this is only a per-call fast path, so evicting the oldest
+   * entry costs a disk read, never a lost conversation.
+   */
   const sessions = new Map<string, string>();
+  const MAX_LIVE_SESSIONS = 500;
   const resumeWindowMs = opts.resumeWindowMs ?? DEFAULT_RESUME_WINDOW_MS;
+
+  function remember(callerId: string, sessionId: string): void {
+    sessions.delete(callerId);
+    sessions.set(callerId, sessionId);
+    while (sessions.size > MAX_LIVE_SESSIONS) {
+      const oldest = sessions.keys().next().value;
+      if (oldest === undefined) break;
+      sessions.delete(oldest);
+    }
+  }
 
   /**
    * Finds the harness session for a caller, in three steps.
@@ -64,21 +83,24 @@ export function createBridge(opts: BridgeOptions) {
    */
   async function sessionFor(callerId: string): Promise<{ id: string; resumed: boolean }> {
     const live = sessions.get(callerId);
-    if (live) return { id: live, resumed: false };
+    if (live) {
+      remember(callerId, live);
+      return { id: live, resumed: false };
+    }
 
     // A resume that throws is a resume that did not happen, never a failed
     // call.
     const stored = await resume(callerId, resumeWindowMs).catch(() => null);
     const harnessId = stored?.harness_session_id;
     if (harnessId) {
-      sessions.set(callerId, harnessId);
+      remember(callerId, harnessId);
       // Nothing is recomputed. The same run ids come back with it, which is
       // what proves the state survived rather than being regenerated.
       return { id: harnessId, resumed: true };
     }
 
     const id = await opts.forge.createSession(opts.agentName);
-    sessions.set(callerId, id);
+    remember(callerId, id);
     // A failed checkpoint costs a future resume, never the call in progress.
     // Same reason as the one after each turn: the store is a convenience, and
     // a caller must never be dropped because a disk write failed.
@@ -90,25 +112,42 @@ export function createBridge(opts: BridgeOptions) {
     return { id, resumed: false };
   }
 
-  /** True when this caller's last turn came back from a checkpoint. Lets the
-   *  endpoint open with a resume line instead of a greeting. */
-  const resumedCallers = new Set<string>();
+  /**
+   * Callers whose NEXT turn is their first after a reconnect.
+   *
+   * This is consumed rather than read, because a latched flag would make
+   * every later turn in the call look like a reconnect and the agent would
+   * keep welcoming somebody back who never left.
+   */
+  const pendingResume = new Set<string>();
   function wasResumed(callerId: string): boolean {
-    return resumedCallers.has(callerId);
+    return pendingResume.has(callerId);
   }
+
+  /** Turns completed per caller, so transcript_index means what it says. */
+  const turnsSeen = new Map<string, number>();
 
   return {
     sessions,
     wasResumed,
     async *runTurn(userText: string, callerId: string): AsyncGenerator<TurnDelta> {
       const { id: sessionId, resumed } = await sessionFor(callerId);
-      if (resumed) resumedCallers.add(callerId);
+      if (resumed) pendingResume.add(callerId);
 
-      let turns = 0;
+      // The cue has to reach the agent, not just sit in a flag the endpoint
+      // never reads. Prefixing the turn is what actually produces the
+      // "welcome back, you were asking about the payoff" beat, and it is
+      // consumed here so only the first turn after a reconnect carries it.
+      const isReconnect = pendingResume.delete(callerId);
+      const content = isReconnect
+        ? `[the caller was disconnected and has rung back. Continue where you ` +
+          `left off, naming the question that was open. Do not greet them again ` +
+          `and do not recompute anything.]\n\n${userText}`
+        : userText;
+
       for await (const event of opts.forge.streamTurn(sessionId, [
-        { type: 'user.message', content: userText },
+        { type: 'user.message', content },
       ])) {
-        turns += 1;
         if (isApprovalRequired(event)) {
           // Never auto-approved here. Auto-approving would defeat the entire
           // point of the project.
@@ -122,9 +161,14 @@ export function createBridge(opts: BridgeOptions) {
 
       // Checkpoint after every turn rather than on disconnect, because a
       // dropped call gives no disconnect to hook. The line just stops.
+      //
+      // transcript_index counts TURNS. It previously incremented per streamed
+      // event, so one turn of opener plus deltas plus completion recorded as
+      // a dozen entries and the resume line pointed at the wrong place.
+      turnsSeen.set(callerId, (turnsSeen.get(callerId) ?? 0) + 1);
       await checkpoint(callerId, {
         harness_session_id: sessionId,
-        transcript_index: turns,
+        transcript_index: turnsSeen.get(callerId) ?? 1,
       }).catch((err: unknown) => {
         // A failed checkpoint costs a resume, never the call in progress.
         console.warn('checkpoint failed for this turn:', err);
