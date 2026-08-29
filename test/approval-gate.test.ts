@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { createBridge } from '../src/telephony/harness-bridge.ts';
+import { createBridge, GATE_QUIET_MS } from '../src/telephony/harness-bridge.ts';
 import { speakNumbers } from '../src/telephony/speech.ts';
 import { TrueForgeClient } from '../src/trueforge/client.ts';
 import {
@@ -612,8 +612,10 @@ test('a gate the operator sits on tells the caller why, and still never decides'
       forge: forge.client,
       agentName: 'northvane',
       // A slow operator: longer than the quiet window, then approves.
+      // Derived from the constant rather than hardcoded, because this test
+      // silently stopped exercising the holding line when the window moved.
       awaitApproval: async () => {
-        await new Promise((r) => setTimeout(r, 2200));
+        await new Promise((r) => setTimeout(r, GATE_QUIET_MS + 700));
         decided += 1;
         return { status: 'allow' };
       },

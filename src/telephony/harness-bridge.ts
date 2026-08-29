@@ -235,13 +235,22 @@ const MAX_REDRAFT_ROUNDS = 2;
  *
  * An operator who clicks straight away should not have their approval
  * talked over, and a caller waiting on a human should not be listening to a
- * line that sounds dead. A beat and a half separates the two.
+ * line that sounds dead.
+ *
+ * This was a beat and a half, which was too eager. Measured live: a gate
+ * opened, an operator approved two seconds later, and the caller still heard
+ * "I need to get that confirmed with the adjuster before I can give you a
+ * figure" immediately before the approved sentence, because the line was
+ * already committed. Reading a pending gate, deciding, and clicking does not
+ * happen inside 1.5 seconds. Five gives a real person time to act without
+ * being contradicted, and still speaks long before a caller concludes the
+ * line has dropped.
  *
  * This is a timer that SPEAKS. It cannot approve, deny, or release
  * anything: when it fires, the turn is still waiting on exactly the same
  * human decision it was waiting on before.
  */
-const GATE_QUIET_MS = 1_500;
+export const GATE_QUIET_MS = 5_000;
 
 export function createBridge(opts: BridgeOptions) {
   /**
