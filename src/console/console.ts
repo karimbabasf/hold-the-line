@@ -621,4 +621,13 @@ function main(): void {
   startReplay(recordedNorthvaneCall(), speed, until);
 }
 
-main();
+// This file is imported under plain Node by test/loadable.test.ts, which
+// walks every src module to catch a runtime-only crash that tsc cannot see
+// (the project's own rule against enums and namespaces exists for the same
+// reason). `typeof document` is the one safe way to ask "is a DOM here"
+// without dereferencing an undeclared global, so importing this module
+// under Node loads it without running it, and a browser still gets a
+// console the moment the script tag executes.
+if (typeof document !== 'undefined') {
+  main();
+}
