@@ -202,9 +202,19 @@ export function createBridge(opts: BridgeOptions) {
   const turnsSeen = new Map<string, number>();
 
   /**
-   * What each caller's settlement is worth, and what an operator has
-   * actually let the agent say out loud. Per caller, because one figure
-   * being approved on one claim must never make it speakable on another.
+   * What each caller's settlement is worth, and which of those figures an
+   * operator has let the agent say out loud.
+   *
+   * Scoped to one call, and cleared when a caller starts a new one. An
+   * approval authorises a sentence about one claim, so carrying the amount
+   * into a later call would let a figure a human approved last week be
+   * spoken about a claim they never saw. That is the same mistake
+   * `authorisedAmountsByClaim` in src/mcp/gated.ts was already fixed for
+   * once. A resumed call keeps both lists, because it is the same call.
+   *
+   * Bounded for the same reason `sessions` is: a phone line runs for months
+   * and every caller who ever rings would otherwise add an entry that is
+   * never removed.
    */
   const bindingByCaller = new Map<string, number[]>();
   const authorisedByCaller = new Map<string, number[]>();
@@ -213,8 +223,19 @@ export function createBridge(opts: BridgeOptions) {
     if (existing) return existing;
     const fresh: number[] = [];
     m.set(callerId, fresh);
+    while (m.size > MAX_LIVE_SESSIONS) {
+      const oldest = m.keys().next().value;
+      if (oldest === undefined) break;
+      m.delete(oldest);
+    }
     return fresh;
   };
+
+  /** Starts a caller's amounts over. A new call has authorised nothing. */
+  function forgetAmounts(callerId: string): void {
+    bindingByCaller.delete(callerId);
+    authorisedByCaller.delete(callerId);
+  }
 
   /**
    * How many times one caller turn may go round the gate before the bridge
@@ -268,13 +289,19 @@ export function createBridge(opts: BridgeOptions) {
 
     let openMessageId: string | null = null;
     let buffer = '';
-    let pending: ToolApprovalRequiredEvent | null = null;
+    /** Every approval this turn parked on. A list rather than one slot: a
+     *  second event would otherwise replace the first and its tool call
+     *  would never be shown to an operator or answered, which strands the
+     *  turn. Live it is always one, but silence is a bad way to find out
+     *  that changed. */
+    const pendingEvents: ToolApprovalRequiredEvent[] = [];
+    const pending = (): boolean => pendingEvents.length > 0;
 
     for await (const event of opts.forge.streamTurn(sessionId, input)) {
       if (isApprovalRequired(event)) {
         // Never auto-approved here. Auto-approving would defeat the entire
         // point of the project.
-        pending = event;
+        pendingEvents.push(event);
         const gated = event.tool_calls.map((c) => c.source_event_id);
         if (openMessageId && !gated.includes(openMessageId)) {
           // Live, the gated call is always the open message, and the turn
@@ -291,7 +318,7 @@ export function createBridge(opts: BridgeOptions) {
 
       // Speech is locked for the rest of the turn. The live harness ends the
       // turn here, but the lock does not depend on that.
-      if (pending) continue;
+      if (pending()) continue;
 
       if (event.type === 'tool.response') {
         for (const amount of bindingAmountsFrom(
@@ -316,7 +343,7 @@ export function createBridge(opts: BridgeOptions) {
       if (text) buffer += text;
     }
 
-    if (!pending) {
+    if (!pending()) {
       const out = releasable(buffer);
       if (out) yield* speakOut(shaper, out);
       return;
@@ -325,13 +352,15 @@ export function createBridge(opts: BridgeOptions) {
     // Held. Describe every gate, wait for every decision, resume only when
     // all of them came back.
     const gates: ResolvedGate[] = [];
-    for (const ref of pending.tool_calls) {
-      const source = ref.source_event_id
-        ? await opts.forge.findEvent(sessionId, ref.source_event_id)
-        : undefined;
-      const gate = resolveGate(ref, pending.thread_id, source);
-      gates.push(gate);
-      opts.onApprovalRequired?.(gate, callerId);
+    for (const event of pendingEvents) {
+      for (const ref of event.tool_calls) {
+        const source = ref.source_event_id
+          ? await opts.forge.findEvent(sessionId, ref.source_event_id)
+          : undefined;
+        const gate = resolveGate(ref, event.thread_id, source);
+        gates.push(gate);
+        opts.onApprovalRequired?.(gate, callerId);
+      }
     }
 
     if (!opts.awaitApproval) {
@@ -374,6 +403,8 @@ export function createBridge(opts: BridgeOptions) {
 
       // Emit console events for session lifecycle changes.
       if (isNew) {
+        // A new call starts with nothing authorised, whoever rang last.
+        forgetAmounts(callerId);
         callStartTimes.set(callerId, Date.now());
         opts.onConsoleEvent?.({
           type: 'call', t: 0, status: 'started', caller: callerId,

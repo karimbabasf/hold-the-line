@@ -439,3 +439,45 @@ test('a gate round never recurses without bound', async () => {
     assert.ok(asked <= 6, `unbounded gate recursion: asked ${asked} times`);
   });
 });
+
+test('an amount authorised on one call is not speakable on the next', async () => {
+  // The same mistake authorisedAmountsByClaim in src/mcp/gated.ts was fixed
+  // for once: an amount a human approved must not follow the phone number
+  // into a claim they never saw.
+  await withStore(async () => {
+    const gated = [
+      message(LIVE_SOURCE_EVENT.id),
+      LIVE_APPROVAL as unknown as TurnEvent,
+      done(),
+    ];
+    const statesTheFigure = [
+      message('m2'),
+      SETTLEMENT_RESPONSE as unknown as TurnEvent,
+      message('m3'),
+      delta('m3', 'We can settle at $13,481.12.'),
+      done(),
+    ];
+    const forge = stubForge({ turns: [gated, statesTheFigure, statesTheFigure] });
+    const options = {
+      forge: forge.client,
+      agentName: 'northvane',
+      awaitApproval: async (): Promise<ApprovalDecision> => ({ status: 'allow' }),
+    };
+
+    // Call one: approved, so the figure is speakable.
+    const first = createBridge(options);
+    const heardFirst = await speak(first.runTurn('is it totaled', CALLER));
+    assert.match(heardFirst, /\$13,481\.12/, 'an approved figure should be speakable');
+
+    // The call ends and the window closes, so ringing back is a new call.
+    await new Promise((r) => setTimeout(r, 15));
+    const second = createBridge({ ...options, resumeWindowMs: 5 });
+    const heardSecond = await speak(second.runTurn('hello again', CALLER));
+
+    assert.doesNotMatch(
+      heardSecond,
+      /13[,.]481/,
+      'last call s approval made a figure speakable on a new call',
+    );
+  });
+});
