@@ -9,3 +9,4 @@ build/
 *.log
 data/*.sqlite
 .tunnel-url
+package-lock.json
