@@ -626,7 +626,7 @@ function main(): void {
 
   // Default: live mode. ?live=<url> overrides the endpoint.
   const liveParam = params.get('live');
-  const liveUrl = liveParam && liveParam !== '1' ? liveParam : '/events';
+  const liveUrl = liveParam && liveParam !== '1' ? liveParam : '/sse';
   startLive(liveUrl);
 }
 

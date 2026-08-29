@@ -142,7 +142,7 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       const url = req.url ?? '/';
       console.log(`${req.method} ${url}`);
 
-      if (url === '/events') {
+      if (url === '/sse') {
         res.writeHead(200, {
           'content-type': 'text/event-stream',
           'cache-control': 'no-cache',
