@@ -143,8 +143,34 @@ export function isMissingSession(err: unknown): boolean {
  * a paraphrase of whatever was withheld: the agent's blocked sentence never
  * reaches the caller in any form.
  */
-const HOLDING_LINE =
+const HOLDING_LINE_FIGURE =
   'I need to get that confirmed with the adjuster before I can give you a figure.';
+
+/**
+ * The same line for a gate that is not about money.
+ *
+ * `require_approval_for_tools` also covers salvage.release_vehicle and
+ * coverage.deny, and telling a caller their figure is being confirmed while
+ * an adjuster decides whether to release their wreck is simply false. The
+ * line only works because it is true, so it has to match the gate that is
+ * actually open. Found by Qodo.
+ */
+const HOLDING_LINE_ACTION =
+  'I need to get that confirmed with the adjuster before I can go ahead.';
+
+/** The gated tools whose approval is about a number the caller is waiting
+ *  on. The rest commit Northvane to an action, not an amount. */
+const FIGURE_TOOLS = new Set([
+  'offer.state_settlement',
+  'settlement.accept',
+  'payment.issue',
+]);
+
+function holdingLineFor(tools: readonly string[]): string {
+  return tools.some((t) => FIGURE_TOOLS.has(t))
+    ? HOLDING_LINE_FIGURE
+    : HOLDING_LINE_ACTION;
+}
 
 /**
  * Hands a withheld sentence back to the agent so it routes it through the
@@ -189,6 +215,9 @@ interface TurnState {
    * because there is nothing being confirmed and saying so would be a lie.
    */
   held: boolean;
+  /** The line to say if this turn ends with nothing spoken. Set beside
+   *  `held` so it always describes why the turn actually went quiet. */
+  line: string;
 }
 
 /**
@@ -451,6 +480,8 @@ export function createBridge(opts: BridgeOptions) {
         `[gate] withheld speech carrying an unauthorised settlement figure: ${blocked.join(', ')}`,
       );
       state.held = true;
+      // A withheld sentence is a withheld amount by construction.
+      state.line = HOLDING_LINE_FIGURE;
       if (remember) state.withheld.push(text);
       return '';
     };
@@ -595,6 +626,13 @@ export function createBridge(opts: BridgeOptions) {
     // A gate opened at all means this turn has a binding sentence it cannot
     // speak yet, which is exactly when the holding line is true.
     state.held = true;
+    state.line = holdingLineFor(gates.map((g) => g.tool));
+    // The agent has now routed through the gate, so any prose withheld
+    // earlier in this turn is superseded. Leaving it queued made the
+    // approved resume redraft a sentence that had already been settled,
+    // which spent a model turn, could reopen a gate, and could tack a
+    // holding line onto a turn that had just succeeded. Found by Qodo.
+    state.withheld.length = 0;
 
     if (round >= MAX_GATE_ROUNDS) {
       console.error(`[gate] gave up after ${MAX_GATE_ROUNDS} rounds without a settled gate`);
@@ -635,7 +673,7 @@ export function createBridge(opts: BridgeOptions) {
     ]);
     clearTimeout(quiet);
     if (!spokeSoon) {
-      yield* speakOut(shaper, HOLDING_LINE);
+      yield* speakOut(shaper, state.line);
     }
 
     const settled = await all;
@@ -714,7 +752,12 @@ export function createBridge(opts: BridgeOptions) {
       if (parked) {
         questionByCaller.delete(callerId);
         const shaper = createSpeechShaper();
-        const state: TurnState = { withheld: [], redrafts: 0, held: false };
+        const state: TurnState = {
+          withheld: [],
+          redrafts: 0,
+          held: false,
+          line: HOLDING_LINE_FIGURE,
+        };
         let saidSomething = false;
         for await (const delta of runGuarded(
           sessionId,
@@ -741,7 +784,7 @@ export function createBridge(opts: BridgeOptions) {
           yield { type: 'message.delta', text: answeredTail };
         }
         if (!saidSomething && state.held) {
-          yield { type: 'message.delta', text: HOLDING_LINE };
+          yield { type: 'message.delta', text: state.line };
         }
         await recordTurn(callerId, sessionId);
         return;
@@ -767,7 +810,12 @@ export function createBridge(opts: BridgeOptions) {
       // attempt costs the resume and never the call. Only before the first
       // delta: retrying after speech would say part of the turn twice.
       let spoke = false;
-      const state: TurnState = { withheld: [], redrafts: 0, held: false };
+      const state: TurnState = {
+          withheld: [],
+          redrafts: 0,
+          held: false,
+          line: HOLDING_LINE_FIGURE,
+        };
       try {
         for await (const delta of runGuarded(
           sessionId,
@@ -820,7 +868,7 @@ export function createBridge(opts: BridgeOptions) {
       // blocked a figure the agent never routed through the gate.
       if (!spoke && state.held) {
         console.warn('[gate] turn held everything it had to say, speaking the holding line');
-        yield { type: 'message.delta', text: HOLDING_LINE };
+        yield { type: 'message.delta', text: state.line };
       }
 
       await recordTurn(callerId, sessionId);

@@ -649,6 +649,93 @@ test('a quick approval is not talked over by the holding line', async () => {
   });
 });
 
+test('an approved turn does not redraft the prose that preceded the gate', async () => {
+  // Prose withheld before the gate used to sit in the turn state across the
+  // approval, so the approved resume redrafted a sentence that was already
+  // settled: a spent model turn that could reopen a gate and tack a holding
+  // line onto a turn that had just succeeded. Found by Qodo.
+  await withStore(async () => {
+    const forge = stubForge({
+      turns: [
+        [
+          message('m1'),
+          SETTLEMENT_RESPONSE as unknown as TurnEvent,
+          // Prose with the figure, withheld, and then the gated call in the
+          // same harness turn.
+          message('m2'),
+          delta('m2', 'The payout comes to $13,481.12.'),
+          message(LIVE_SOURCE_EVENT.id),
+          LIVE_APPROVAL as unknown as TurnEvent,
+          done(),
+        ],
+        [message('m3'), delta('m3', 'We can settle this claim for $13,481.12.'), done()],
+      ],
+    });
+    const bridge = createBridge({
+      forge: forge.client,
+      agentName: 'northvane',
+      awaitApproval: async () => ({ status: 'allow' }),
+    });
+    const said = await speak(bridge.runTurn('what is the payout', CALLER));
+
+    // One turn in, one resume out. No third, stale redraft.
+    assert.equal(
+      forge.inputs.length,
+      2,
+      `an extra redraft ran after the approval: ${JSON.stringify(forge.inputs.map((i) => i[0]?.type))}`,
+    );
+    assert.match(said, /13,481 dollars and 12 cents/);
+    assert.doesNotMatch(
+      said,
+      /confirmed with the adjuster/,
+      'a holding line was appended to a turn that succeeded',
+    );
+  });
+});
+
+test('a gate that is not about money does not promise a figure', async () => {
+  // require_approval_for_tools also covers salvage.release_vehicle and
+  // coverage.deny. Telling a caller their figure is being confirmed while an
+  // adjuster decides whether to release their wreck is false, and the line
+  // only works because it is true. Found by Qodo.
+  await withStore(async () => {
+    const salvageSource: ModelMessageEvent = {
+      type: 'model.message',
+      id: 'ev-salvage',
+      tool_calls: [
+        {
+          id: 'call_salvage',
+          type: 'function',
+          function: {
+            name: 'call_tool',
+            arguments: JSON.stringify({
+              mcp_server: 'northvane',
+              tool_name: 'salvage.release_vehicle',
+              input: { claim_id: 'CLM-40218', yard_id: 'YRD-118' },
+            }),
+          },
+        },
+      ],
+    };
+    const salvageGate = {
+      type: 'tool.approval_required',
+      id: 'ev-approve-salvage',
+      created_at: '2026-08-29T16:20:27.286Z',
+      thread_id: 'main',
+      tool_calls: [{ id: 'call_salvage', source_event_id: 'ev-salvage' }],
+    };
+    const forge = stubForge({
+      turns: [[message('ev-salvage'), salvageGate as unknown as TurnEvent, done()]],
+      sourceEvents: [salvageSource],
+    });
+    const bridge = createBridge({ forge: forge.client, agentName: 'northvane' });
+    const said = await speak(bridge.runTurn('can you release the car', CALLER));
+
+    assert.match(said, /before I can go ahead/);
+    assert.doesNotMatch(said, /give you a figure/, 'a salvage gate promised a figure');
+  });
+});
+
 test('the live approval event shape is recognised', () => {
   assert.equal(
     isApprovalRequired(LIVE_APPROVAL as unknown as TurnEvent),
