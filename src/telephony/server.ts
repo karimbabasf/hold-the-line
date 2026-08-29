@@ -220,6 +220,20 @@ const GATE_ADMIN_SECRET = process.env.GATE_ADMIN_SECRET;
  * caller hearing nothing is recoverable and a caller hearing a sentence
  * nobody stands behind is not.
  */
+const GATE_RECORD_TIMEOUT_MS = 5_000;
+
+/**
+ * Recordings run one at a time.
+ *
+ * `/gate/pending` then `/gate/approve` is two requests against one slot in
+ * the tool process, so two approvals landing together can interleave and
+ * one operator's wording ends up filed under the other's draft. Serialising
+ * costs nothing at one gate a call and removes the interleave entirely.
+ * The slot itself is a documented scope limit in src/mcp/gated.ts; this
+ * stops this side making it worse. Found by Qodo.
+ */
+let recording: Promise<unknown> = Promise.resolve();
+
 async function recordApprovedWording(gate: ResolvedGate): Promise<boolean> {
   const utterance = gate.utterance;
   if (gate.tool !== 'offer.state_settlement') return true;
@@ -231,34 +245,45 @@ async function recordApprovedWording(gate: ResolvedGate): Promise<boolean> {
   }
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (GATE_ADMIN_SECRET) headers['authorization'] = `Bearer ${GATE_ADMIN_SECRET}`;
-  try {
-    const pending = await fetch(`${MCP_BASE_URL}/gate/pending`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
+
+  const run = async (): Promise<boolean> => {
+    // A deadline on both requests. Without one, a tool process that accepts
+    // the connection and then stalls leaves the operator's click pending
+    // forever and the gate never settles either way. Found by Qodo.
+    const post = (path: string, body: unknown): Promise<Response> =>
+      fetch(`${MCP_BASE_URL}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(GATE_RECORD_TIMEOUT_MS),
+      });
+    try {
+      const pending = await post('/gate/pending', {
         claim_id: gate.claim_id,
         wanted: utterance,
         authorised_amounts: gate.authorised_amounts ?? [],
-      }),
-    });
-    if (!pending.ok) {
-      console.error(`[gate] /gate/pending refused the draft: ${pending.status}`);
+      });
+      if (!pending.ok) {
+        console.error(`[gate] /gate/pending refused the draft: ${pending.status}`);
+        return false;
+      }
+      const approve = await post('/gate/approve', { text: utterance });
+      if (!approve.ok) {
+        console.error(`[gate] /gate/approve refused the wording: ${approve.status}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error('[gate] could not record an approval with the tool process:', err);
       return false;
     }
-    const approve = await fetch(`${MCP_BASE_URL}/gate/approve`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ text: utterance }),
-    });
-    if (!approve.ok) {
-      console.error(`[gate] /gate/approve refused the wording: ${approve.status}`);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error('[gate] could not reach the tool process to record an approval:', err);
-    return false;
-  }
+  };
+
+  const mine = recording.then(run, run);
+  // The chain must survive a rejection, or one failure wedges every later
+  // approval behind it.
+  recording = mine.catch(() => undefined);
+  return mine;
 }
 
 async function decideFromBody(raw: string): Promise<{ status: number; body: unknown }> {
