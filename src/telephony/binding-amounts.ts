@@ -56,13 +56,97 @@ export function bindingAmountsFrom(content: unknown): number[] {
  */
 const MONEY = /\$?\d+(?:,\d{3})*(?:\.\d{1,2})?/g;
 
+/**
+ * The same figures written out in words.
+ *
+ * Every live capture used digits, but a rule that only reads digits is a
+ * rule the agent can walk around by wording, and the invariant is about the
+ * amount rather than about one way of typing it. Found by Qodo.
+ *
+ * False positives cost nothing here: a parsed value is only ever compared
+ * against amounts a tool has already declared binding, so "a 2021 Subaru"
+ * parsing as 2021 blocks nothing.
+ */
+const WORD_VALUES = new Map<string, number>([
+  ['zero', 0], ['one', 1], ['two', 2], ['three', 3], ['four', 4],
+  ['five', 5], ['six', 6], ['seven', 7], ['eight', 8], ['nine', 9],
+  ['ten', 10], ['eleven', 11], ['twelve', 12], ['thirteen', 13],
+  ['fourteen', 14], ['fifteen', 15], ['sixteen', 16], ['seventeen', 17],
+  ['eighteen', 18], ['nineteen', 19], ['twenty', 20], ['thirty', 30],
+  ['forty', 40], ['fifty', 50], ['sixty', 60], ['seventy', 70],
+  ['eighty', 80], ['ninety', 90],
+]);
+const WORD_SCALES = new Map<string, number>([
+  ['hundred', 100], ['thousand', 1000], ['million', 1_000_000],
+]);
+
+/** Reads runs of number words, pairing a "dollars" run with a "cents" run. */
+function spelledAmounts(text: string): number[] {
+  const words = text.toLowerCase().replace(/[-,]/g, ' ').split(/[^a-z]+/);
+  const found: number[] = [];
+
+  let total = 0;
+  let current = 0;
+  let started = false;
+  let dollars: number | null = null;
+
+  const value = (): number => total + current;
+  const reset = (): void => {
+    total = 0;
+    current = 0;
+    started = false;
+  };
+
+  for (const word of words) {
+    const unit = WORD_VALUES.get(word);
+    if (unit !== undefined) {
+      current += unit;
+      started = true;
+      continue;
+    }
+    const scale = WORD_SCALES.get(word);
+    if (scale !== undefined && started) {
+      if (scale === 100) current = (current === 0 ? 1 : current) * 100;
+      else {
+        total += (current === 0 ? 1 : current) * scale;
+        current = 0;
+      }
+      continue;
+    }
+    // "and" joins parts of one figure ("four hundred and eighty one", and
+    // "eighty one dollars and twelve cents"), so it never ends a run.
+    if (word === 'and' || word === '') continue;
+
+    if (word === 'dollars' || word === 'dollar') {
+      if (started) {
+        dollars = value();
+        found.push(dollars);
+      }
+      reset();
+      continue;
+    }
+    if (word === 'cents' || word === 'cent') {
+      if (started && dollars !== null) found.push(dollars + value() / 100);
+      dollars = null;
+      reset();
+      continue;
+    }
+    // Any other word ends the run.
+    if (started) found.push(value());
+    dollars = null;
+    reset();
+  }
+  if (started) found.push(value());
+  return found;
+}
+
 export function spokenAmounts(text: string): number[] {
   const found: number[] = [];
   for (const match of text.matchAll(MONEY)) {
     const n = Number(match[0].replace(/[$,]/g, ''));
     if (Number.isFinite(n)) found.push(n);
   }
-  return found;
+  return [...found, ...spelledAmounts(text)];
 }
 
 /**
@@ -77,17 +161,23 @@ export function unauthorisedAmounts(
   authorised: readonly number[],
 ): number[] {
   if (binding.length === 0) return [];
-  const bindingCents = new Set(binding.map(toCents));
   const authorisedCents = new Set(authorised.map(toCents));
   const out: number[] = [];
+
   for (const amount of spokenAmounts(text)) {
     const cents = toCents(amount);
-    if (bindingCents.has(cents) && !authorisedCents.has(cents)) {
-      // Report the binding amount, not the parse, so a caller-facing log
-      // says the same figure the operator would see.
-      const original = binding.find((b) => toCents(b) === cents);
-      if (original !== undefined && !out.includes(original)) out.push(original);
-    }
+    // Whole dollars count as the same commitment. "thirteen thousand four
+    // hundred eighty-one dollars" is the same offer as 13,481.12 to anyone
+    // listening, and matching only the exact cents would let the agent
+    // round its way past the gate.
+    const match = binding.find(
+      (b) => toCents(b) === cents || Math.trunc(b) === Math.trunc(amount),
+    );
+    if (match === undefined) continue;
+    if (authorisedCents.has(toCents(match))) continue;
+    // Report the binding amount, not the parse, so a log says the same
+    // figure the operator would see.
+    if (!out.includes(match)) out.push(match);
   }
   return out;
 }

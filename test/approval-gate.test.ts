@@ -440,6 +440,56 @@ test('a gate round never recurses without bound', async () => {
   });
 });
 
+test('every gate has a waiter before any of them is announced', async () => {
+  // Announcing first and awaiting one at a time made a gate visible to an
+  // operator with nothing listening for its answer, so a decision on the
+  // second of two gates was dropped and that gate then hung. Found by Qodo.
+  await withStore(async () => {
+    const twoGates = {
+      type: 'tool.approval_required',
+      id: 'ev-approve-2',
+      created_at: '2026-08-29T16:20:27.286Z',
+      thread_id: 'main',
+      tool_calls: [
+        { id: 'call_one', source_event_id: LIVE_SOURCE_EVENT.id },
+        { id: 'call_two', source_event_id: LIVE_SOURCE_EVENT.id },
+      ],
+    };
+    const forge = stubForge({
+      turns: [
+        [message(LIVE_SOURCE_EVENT.id), twoGates as unknown as TurnEvent, done()],
+        [message('m2'), delta('m2', 'done'), done()],
+      ],
+    });
+
+    const waiting = new Set<string>();
+    const announced: string[] = [];
+    const bridge = createBridge({
+      forge: forge.client,
+      agentName: 'northvane',
+      onApprovalRequired: (gate) => {
+        announced.push(gate.tool_call_id);
+        assert.ok(
+          waiting.has(gate.tool_call_id),
+          `${gate.tool_call_id} was announced with nothing waiting on it`,
+        );
+      },
+      awaitApproval: async (gate) => {
+        waiting.add(gate.tool_call_id);
+        return { status: 'allow' };
+      },
+    });
+    await speak(bridge.runTurn('is it totaled', CALLER));
+
+    assert.deepEqual(announced, ['call_one', 'call_two']);
+    // Both decisions have to reach the harness, not just the first.
+    assert.deepEqual(
+      (forge.inputs[1] ?? []).map((i) => (i as { tool_call_id?: string }).tool_call_id),
+      ['call_one', 'call_two'],
+    );
+  });
+});
+
 test('an amount authorised on one call is not speakable on the next', async () => {
   // The same mistake authorisedAmountsByClaim in src/mcp/gated.ts was fixed
   // for once: an amount a human approved must not follow the phone number

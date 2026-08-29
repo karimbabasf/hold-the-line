@@ -349,19 +349,31 @@ export function createBridge(opts: BridgeOptions) {
       return;
     }
 
-    // Held. Describe every gate, wait for every decision, resume only when
-    // all of them came back.
+    // Held. Resolve every gate, then wait for every decision, then resume.
     const gates: ResolvedGate[] = [];
     for (const event of pendingEvents) {
       for (const ref of event.tool_calls) {
         const source = ref.source_event_id
           ? await opts.forge.findEvent(sessionId, ref.source_event_id)
           : undefined;
-        const gate = resolveGate(ref, event.thread_id, source);
-        gates.push(gate);
-        opts.onApprovalRequired?.(gate, callerId);
+        gates.push(resolveGate(ref, event.thread_id, source));
       }
     }
+
+    if (round >= MAX_GATE_ROUNDS) {
+      console.error(`[gate] gave up after ${MAX_GATE_ROUNDS} rounds without a settled gate`);
+      for (const gate of gates) opts.onApprovalRequired?.(gate, callerId);
+      return;
+    }
+
+    // Every waiter is installed BEFORE any gate is announced. Announcing
+    // first and awaiting one at a time made a gate visible to an operator
+    // with nothing yet listening for its answer, so deciding the second of
+    // two gates was dropped and that gate then hung. Found by Qodo.
+    const decisions = opts.awaitApproval
+      ? gates.map((gate) => opts.awaitApproval!(gate, callerId))
+      : [];
+    for (const gate of gates) opts.onApprovalRequired?.(gate, callerId);
 
     if (!opts.awaitApproval) {
       console.warn(
@@ -369,16 +381,17 @@ export function createBridge(opts: BridgeOptions) {
       );
       return;
     }
-    if (round >= MAX_GATE_ROUNDS) {
-      console.error(`[gate] gave up after ${MAX_GATE_ROUNDS} rounds without a settled gate`);
-      return;
-    }
+
+    // Settle every gate before acting on any of them, so an abandoned
+    // waiter cannot outlive the turn that opened it.
+    const settled = await Promise.all(decisions);
+    // No decision is not a decision to allow. One undecided gate holds the
+    // whole turn, because the turn resumes as one call or not at all.
+    if (settled.some((d) => !d)) return;
 
     const resumeInput: TurnInputItem[] = [];
-    for (const gate of gates) {
-      const decision = await opts.awaitApproval(gate, callerId);
-      // No decision is not a decision to allow. Speak nothing.
-      if (!decision) return;
+    gates.forEach((gate, i) => {
+      const decision = settled[i] as ApprovalDecision;
       if (decision.status === 'allow') {
         for (const amount of gate.authorised_amounts ?? []) {
           if (!authorised.includes(amount)) authorised.push(amount);
@@ -390,7 +403,7 @@ export function createBridge(opts: BridgeOptions) {
         tool_call_id: gate.tool_call_id,
         approval: decision,
       });
-    }
+    });
 
     yield* runGuarded(sessionId, resumeInput, callerId, round + 1, shaper);
   }

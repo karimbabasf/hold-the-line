@@ -77,6 +77,47 @@ test('nothing is held before a settlement has been calculated', () => {
   assert.deepEqual(unauthorisedAmounts('we can pay $13,481.12', [], []), []);
 });
 
+test('a figure spelled out in words is held too', () => {
+  // Every live capture used digits, but a rule that only reads digits is a
+  // rule the agent can walk around by wording. Found by Qodo.
+  for (const said of [
+    'thirteen thousand four hundred eighty-one dollars and twelve cents',
+    'thirteen thousand four hundred and eighty-one dollars and twelve cents',
+    'we can settle for thirteen thousand four hundred eighty one dollars twelve cents today',
+    // Rounded to whole dollars is the same commitment to anyone listening.
+    'we can offer thirteen thousand four hundred eighty-one dollars',
+    'we can offer $13,481',
+  ]) {
+    assert.deepEqual(unauthorisedAmounts(said, [NET], []), [NET], said);
+  }
+});
+
+test('spelling out an ordinary figure is still not held', () => {
+  assert.deepEqual(
+    unauthorisedAmounts('your deductible is one thousand dollars', [NET], []),
+    [],
+  );
+  assert.deepEqual(
+    unauthorisedAmounts(
+      'it is a 2021 Subaru Outback with fifty two thousand four hundred miles',
+      [NET],
+      [],
+    ),
+    [],
+  );
+});
+
+test('an approval covers the figure however the agent words it', () => {
+  assert.deepEqual(
+    unauthorisedAmounts(
+      'thirteen thousand four hundred eighty-one dollars and twelve cents',
+      [NET],
+      [NET],
+    ),
+    [],
+  );
+});
+
 test('amounts compare in cents, never as floats', () => {
   // 8699.72 + 35 * 1.84 is 8764.119999999999 in binary floating point.
   const computed = 8699.72 + 35 * 1.84;
