@@ -31,6 +31,21 @@ export interface ChatEndpointDeps {
     callerId: string,
     signal?: AbortSignal,
   ) => AsyncIterable<TurnDelta>;
+
+  /**
+   * The caller's socket went away. This is the end of the call.
+   *
+   * There is no disconnect webhook on this path: Telnyx holds one request per
+   * turn and hangs up by stopping reading, so the only honest end-of-call
+   * signal this process ever gets is the request being aborted or the
+   * response stream being cancelled. Both are here and nowhere else. In
+   * particular the abort at the natural end of a turn does NOT come through
+   * here, because a finished turn is not a finished call, and a console told
+   * otherwise would blank the screen between two sentences.
+   *
+   * Called at most once per request.
+   */
+  onCallerGone?: (callerId: string) => void;
 }
 
 interface ChatMessage {
@@ -71,13 +86,26 @@ export function createChatEndpoint(
     const giveUp = (why: string) => {
       if (!hangup.signal.aborted) hangup.abort(new Error(why));
     };
+
+    // The caller is GONE, as opposed to the turn merely being over. Latched,
+    // because both paths below can fire for one hangup and the call only ends
+    // once.
+    let announcedGone = false;
+    const callerGone = (why: string) => {
+      giveUp(why);
+      if (announcedGone) return;
+      announcedGone = true;
+      deps.onCallerGone?.(callerId);
+    };
+
     if (req.signal.aborted) {
       // 499 rather than 200: nothing was streamed, so this can still be a
       // status, and opening a harness turn for a caller who has already gone
       // costs a session and a model call for nobody.
+      callerGone('caller hung up before the turn started');
       return json({ error: 'caller hung up before the turn started' }, 499);
     }
-    req.signal.addEventListener('abort', () => giveUp('request aborted'));
+    req.signal.addEventListener('abort', () => callerGone('request aborted'));
 
     // Set once the stream is gone, so the rest of a turn that is still
     // unwinding does not throw trying to speak into it.
@@ -141,7 +169,7 @@ export function createChatEndpoint(
         // the socket close is noticed by the server, which cancels this
         // stream. See server.ts.
         shut = true;
-        giveUp(`response cancelled: ${String(reason ?? 'no reason given')}`);
+        callerGone(`response cancelled: ${String(reason ?? 'no reason given')}`);
       },
     });
 

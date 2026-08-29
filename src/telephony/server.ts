@@ -123,7 +123,13 @@ const bridge = createBridge({
 });
 
 /**
- * Wraps a turn so the console learns two things only this process knows.
+ * Wraps a turn so the console learns three things only this process knows.
+ *
+ * The transcript, first. The caller's utterance is the user message on this
+ * request and it arrives whole. The agent's half is the text already on its
+ * way out to Telnyx, so it is what the caller hears: the speech shaper has
+ * run, and a message the approval gate withheld never gets here to be
+ * reported as spoken.
  *
  * Hold is the dead air between a caller finishing a sentence and hearing the
  * first word back. That is the real thing an operator watches, and it is
@@ -141,10 +147,18 @@ const bridge = createBridge({
  * The caller id goes with both, so a second caller ringing in while this call
  * is on screen cannot fold their hold time or their figures into it.
  */
-async function* observedTurn(userText: string, callerId: string) {
+async function* observedTurn(userText: string, callerId: string, signal?: AbortSignal) {
+  live.callerSaid(userText, callerId);
   live.holdStarted(callerId);
   try {
-    for await (const delta of bridge.runTurn(userText, callerId)) {
+    // The signal goes through. It was being dropped here, and dropping it took
+    // two things down with it: the harness stream was never aborted when a
+    // caller hung up, and `awaitApproval` in the gate wiring above is handed
+    // `undefined` and returns before installing its abort handler, so a held
+    // gate never released and `call ended` was never emitted at all. The turn
+    // then sat open forever, which is why an operator watched a hold clock run
+    // on a call nobody was on.
+    for await (const delta of bridge.runTurn(userText, callerId, signal)) {
       if (delta.text) {
         live.holdStopped(callerId);
         live.noteSpokenText(delta.text, callerId);
@@ -157,7 +171,15 @@ async function* observedTurn(userText: string, callerId: string) {
   }
 }
 
-const chat = createChatEndpoint({ runTurn: observedTurn });
+const chat = createChatEndpoint({
+  runTurn: observedTurn,
+  // The caller's socket going away is the only honest end of call on this
+  // path. See the note on `onCallerGone`.
+  onCallerGone: (callerId) => {
+    console.log(`[call] ${callerId} is gone`);
+    live.callEnded(callerId);
+  },
+});
 
 /**
  * One decision on one held gate, from a request body.

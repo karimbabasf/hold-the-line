@@ -41,7 +41,7 @@ import {
 import { daysBetween, settle } from '../settle/settle.ts';
 import { LANES, type LaneDef } from './lanes.ts';
 import { reportEvent } from './report.ts';
-import { createLaneWindow, laneNameFor, numbersFrom, summarise } from './telemetry.ts';
+import { createLaneWindow, laneNameFor, millis, numbersFrom, summarise } from './telemetry.ts';
 import {
   approveGate,
   coverageDeny,
@@ -110,7 +110,10 @@ function openLane(name: string, runId: string): (result: unknown, error?: unknow
   report({ type: 'lane', name: laneName, tool: name, status: 'pending' });
 
   return (result: unknown, error?: unknown) => {
-    const elapsed = Math.round(performance.now() - startedAt);
+    // Fractional milliseconds, not a rounded integer. A fixture read finishes
+    // in well under a millisecond, so rounding reported every lane on a live
+    // call as 0 and the console rendered "0.0s" for all five. See millis().
+    const elapsed = millis(performance.now() - startedAt);
     laneWindow.ended(elapsed);
     const summary =
       error === undefined
@@ -278,7 +281,10 @@ export function stateRulesGet(args: { state: string }) {
  * can run together do, and the timings come back for the console.
  */
 export async function claimSnapshot(args: { claim_id: string }) {
-  const started = Date.now();
+  // performance.now, not Date.now: these lookups are local fixture reads that
+  // finish inside one millisecond, and a millisecond-resolution clock reports
+  // every one of them as 0.
+  const started = performance.now();
   const timings: Array<{ lane: string; elapsed_ms: number }> = [];
 
   /**
@@ -290,14 +296,14 @@ export async function claimSnapshot(args: { claim_id: string }) {
   async function lane<T>(tool: string, fn: () => T): Promise<T> {
     const runId = nextToolRun(tool);
     const closeLane = openLane(tool, runId);
-    const t0 = Date.now();
+    const t0 = performance.now();
     try {
       const out = await Promise.resolve(fn());
-      timings.push({ lane: tool, elapsed_ms: Date.now() - t0 });
+      timings.push({ lane: tool, elapsed_ms: millis(performance.now() - t0) });
       closeLane(out);
       return out;
     } catch (err) {
-      timings.push({ lane: tool, elapsed_ms: Date.now() - t0 });
+      timings.push({ lane: tool, elapsed_ms: millis(performance.now() - t0) });
       closeLane(undefined, err ?? new Error('lookup failed'));
       throw err;
     }
@@ -321,12 +327,12 @@ export async function claimSnapshot(args: { claim_id: string }) {
     lienholderPayoffQuote({ loan_id: vehicle.lien.loan_id, through_date: vehicle.lien.good_through }),
   );
 
-  const serial_ms = timings.reduce((a, t) => a + t.elapsed_ms, 0);
+  const serial_ms = millis(timings.reduce((a, t) => a + t.elapsed_ms, 0));
   return {
     claim, vehicle, comps, payoff, storage, state_rules: rules,
     policy: policyLookup({ phone: loadPolicy().phone }),
     lanes: timings,
-    parallel_ms: Date.now() - started,
+    parallel_ms: millis(performance.now() - started),
     serial_ms,
   };
 }
@@ -597,8 +603,8 @@ export async function runLanes<L extends { delayMs: number }, R>(
   );
   return {
     results: timed.map((t) => t.result),
-    parallel_ms: performance.now() - wallStart,
-    serial_ms: timed.reduce((sum, t) => sum + t.ms, 0),
+    parallel_ms: millis(performance.now() - wallStart),
+    serial_ms: millis(timed.reduce((sum, t) => sum + t.ms, 0)),
   };
 }
 

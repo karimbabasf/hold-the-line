@@ -53,6 +53,9 @@
  *                      `run_ids` across the gap as the proof that a resumed
  *                      call recomputed nothing.
  *   - `call`           bookends the stream.
+ *   - `transcript`     one line of what was actually said, by the caller or
+ *                      by the agent. Added after the seven above, so the
+ *                      count is now eight.
  *
  * There is a second wire in this file, `ReportFrame` and `ReportBatch`. The
  * five event types that fill the console's panes are produced where the tools
@@ -194,6 +197,36 @@ export interface CallEvent {
   caller?: string;
 }
 
+/**
+ * One line of what was actually said on the call.
+ *
+ * `who: 'caller'` is the user message off `POST /v1/chat/completions`, which
+ * arrives whole, so it is always `final: true`.
+ *
+ * `who: 'agent'` is the text on its way out to Telnyx, taken DOWNSTREAM of
+ * the speech shaper in `src/telephony/speech.ts`. That matters: the shaper
+ * drops a repeated filler and rewrites "$13,481.12" into the words a phone
+ * voice reads correctly, and a message the approval gate withheld never
+ * reaches it at all. So this is what the caller heard, not what the harness
+ * drafted.
+ *
+ * `text` on an agent partial is CUMULATIVE, not the delta on its own: every
+ * `final: false` event carries the whole of what the agent has said this turn
+ * so far, and the single `final: true` at the end of the turn carries the
+ * settled line. A client renders one line per turn and replaces it on each
+ * event rather than appending. Cumulative because a frame lost to a reconnect
+ * or to the ring buffer would otherwise take its words out of the transcript
+ * silently, and a transcript that quietly drops words is the same class of
+ * failure the provenance counters exist to catch.
+ */
+export interface TranscriptEvent {
+  type: 'transcript';
+  t: Millis;
+  who: 'caller' | 'agent';
+  text: string;
+  final: boolean;
+}
+
 export type ConsoleEvent =
   | LaneEvent
   | LanesSummaryEvent
@@ -201,7 +234,8 @@ export type ConsoleEvent =
   | GateEvent
   | HoldEvent
   | SessionEvent
-  | CallEvent;
+  | CallEvent
+  | TranscriptEvent;
 
 /** `Omit` over a union has to be distributed by hand, or it collapses the
  *  seven variants into one object with only their shared keys. */
@@ -302,6 +336,12 @@ export function isConsoleEvent(value: unknown): value is ConsoleEvent {
       return typeof v['session_id'] === 'string';
     case 'call':
       return true;
+    case 'transcript':
+      return (
+        (v['who'] === 'caller' || v['who'] === 'agent') &&
+        typeof v['text'] === 'string' &&
+        typeof v['final'] === 'boolean'
+      );
     default:
       return false;
   }

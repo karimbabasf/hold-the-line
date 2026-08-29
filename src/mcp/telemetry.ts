@@ -24,6 +24,33 @@ import { LANES } from './lanes.ts';
 
 export type NumberBody = Extract<ConsoleEventBody, { type: 'number' }>;
 
+/**
+ * Milliseconds, kept to the microsecond.
+ *
+ * Every one of these used to be `Math.round`ed, and every lane on a live call
+ * came out 0: the fixtures are local files, so a lookup that a real claims
+ * database would answer in 400ms answers here in under a millisecond. The
+ * console then rendered "0.0s" for every lane and "0.0s parallel versus 0.0s
+ * serial" for the summary, and working software read as broken software.
+ *
+ * The fix is precision, not padding. Nothing here sleeps to make a number
+ * look better; the numbers reported are what actually elapsed, and three
+ * decimal places is enough to show it.
+ */
+export const millis = (ms: number): number => Math.round(ms * 1000) / 1000;
+
+/**
+ * A duration as an operator would say it.
+ *
+ * Under a second reads in milliseconds, because "0.0s" for a 0.4ms lookup is
+ * a rounding error presented as a measurement.
+ */
+export function spokenDuration(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms >= 10) return `${Math.round(ms)}ms`;
+  return `${millis(ms)}ms`;
+}
+
 export interface LaneWindowOptions {
   report: (event: ConsoleEventBody) => void;
   /** How long the window waits, with nothing running, before it decides the
@@ -70,8 +97,8 @@ export function createLaneWindow(options: LaneWindowOptions) {
       running = Math.max(0, running - 1);
       if (running > 0) return;
       cancelClose();
-      const parallelMs = Math.round(performance.now() - wallStart);
-      const totalSerial = Math.round(serialMs);
+      const parallelMs = millis(performance.now() - wallStart);
+      const totalSerial = millis(serialMs);
       closeTimer = setTimeout(() => {
         closeTimer = undefined;
         serialMs = 0;
@@ -168,7 +195,7 @@ export function summarise(tool: string, result: unknown): string | undefined {
       const serial = num(r, 'serial_ms');
       return parallel === null || serial === null
         ? 'claim, vehicle, comps, payoff, storage, rules'
-        : `six lookups in ${(parallel / 1000).toFixed(1)}s, ${(serial / 1000).toFixed(1)}s if serial`;
+        : `six lookups in ${spokenDuration(parallel)}, ${spokenDuration(serial)} if serial`;
     }
     case 'settlement.calculate': {
       const net = num(r, 'net');

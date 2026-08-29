@@ -140,6 +140,21 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
   const warnedCallers = new Set<string>();
   let onHold = false;
   let pendingHold = false;
+  /**
+   * True once this call has ended. A call ends once. Two things can notice a
+   * hangup (the endpoint losing the caller's socket, and a held gate's abort
+   * handler), and both are right to say so, but the console must be told once
+   * or its header flips back out of "call over".
+   */
+  let callOver = false;
+  /**
+   * Caller utterances that arrived before the call was reported, for the same
+   * reason as `pendingHold`: the first turn hands over the caller's words
+   * before the bridge has opened a session and said the call began, and
+   * `call started` empties the replay buffer, so anything broadcast ahead of
+   * it is gone from a console that connects a second later.
+   */
+  const pendingCallerText: string[] = [];
   let warnedUnconfigured = false;
 
   /** True when this turn belongs to the call the console is showing. */
@@ -182,6 +197,18 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
       alreadySpoken.clear();
       turnText = '';
       onHold = false;
+      callOver = false;
+    } else if (event.type === 'call' && event.status === 'ended') {
+      // A call that never started cannot end, and one that already ended does
+      // not end twice. Dropping the repeat here rather than at each caller
+      // keeps every path that notices a hangup honest without any of them
+      // having to know about the others.
+      if (callStart === null || callOver) return;
+      callOver = true;
+      // Nobody is on hold on a dead line. This is the last chance to stop
+      // that clock, and it goes out BEFORE the call frame so an operator
+      // reads it in the order it happened.
+      holdStopped();
     } else if (callStart === null && event.type === 'session' && event.status === 'resumed') {
       // A call that came back after this process restarted never reports a
       // `call started`: the bridge finds a checkpoint and reports a resume.
@@ -209,8 +236,15 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     push(frame, stamped);
     for (const client of clients) client.write(frame.text);
 
-    // A hold that was asked for before the call was reported goes out now,
-    // in the order an operator reads: the call, then the caller waiting on it.
+    // What was held back until the call clock existed now goes out, in the
+    // order an operator reads it: the call, what the caller said, then the
+    // caller waiting on an answer. Spliced before the loop, so the nested
+    // broadcast each one runs finds nothing left to flush.
+    if (callStart !== null && pendingCallerText.length > 0) {
+      for (const said of pendingCallerText.splice(0)) {
+        emit({ type: 'transcript', who: 'caller', text: said, final: true });
+      }
+    }
     if (pendingHold && callStart !== null) {
       pendingHold = false;
       holdStarted();
@@ -308,12 +342,52 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     emit({ type: 'hold', status: 'stopped' });
   }
 
+  /**
+   * The caller's own words, off the user message on the chat endpoint.
+   *
+   * One utterance arrives whole, so it is final the moment it arrives. Held
+   * back only when there is no call clock yet, which is the first turn of
+   * every call.
+   */
+  function callerSaid(text: string, callerId?: string): void {
+    if (!ownsCall(callerId)) return;
+    const said = text.trim();
+    if (said === '') return;
+    if (callStart === null) {
+      pendingCallerText.push(said);
+      return;
+    }
+    emit({ type: 'transcript', who: 'caller', text: said, final: true });
+  }
+
+  /**
+   * The call ended.
+   *
+   * Named rather than left to callers assembling their own `call` event, so
+   * that every path which notices a hangup produces the same thing: the hold
+   * clock stopped, one `call ended`, and nothing at all if the call already
+   * ended or never started.
+   */
+  function callEnded(callerId?: string): void {
+    if (!ownsCall(callerId)) return;
+    emit({
+      type: 'call',
+      status: 'ended',
+      ...(callerId === undefined ? {} : { caller: callerId }),
+    });
+  }
+
   /** Text on its way to TTS. Buffered rather than scanned per chunk, because
    *  a figure arrives split across deltas ("13,481" then " dollars and 12
    *  cents") and half a number is not a number. */
   function noteSpokenText(text: string, callerId?: string): void {
     if (!ownsCall(callerId)) return;
     turnText += text;
+    // The partial transcript, live. This is called with text that has already
+    // been through the speech shaper, so it is what the caller is hearing
+    // rather than what the harness drafted: a withheld message never reaches
+    // here at all. Cumulative per turn, per the contract in events.ts.
+    emit({ type: 'transcript', who: 'agent', text: turnText, final: false });
   }
 
   /** End of the agent's turn: everything it said is now complete text. */
@@ -322,6 +396,11 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     const text = turnText;
     turnText = '';
     if (text === '') return;
+
+    // The settled line. Nothing spoken means nothing to settle, which is why
+    // this is after the empty check: a turn the gate withheld entirely leaves
+    // no transcript line claiming the agent said something.
+    emit({ type: 'transcript', who: 'agent', text, final: true });
 
     for (const found of extractSpokenNumbers(text)) {
       // Money spoken as money can only be money. A bare number could be any
@@ -358,8 +437,11 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     ingest,
     holdStarted,
     holdStopped,
+    callerSaid,
+    callEnded,
     noteSpokenText,
     endSpokenTurn,
+    onCall: (): boolean => callStart !== null && !callOver,
     clientCount: (): number => clients.size,
     bufferedFrames: (): number => buffer.length,
   };
