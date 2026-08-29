@@ -57,6 +57,9 @@ export const DEFAULT_RESUME_WINDOW_MS = 10 * 60_000;
 // process.cwd() so it is correct no matter where the server is started
 // from. Matches the fixtures.ts convention. Overridable via env so tests
 // never touch, or race each other over, the real checkpoint file.
+// Checkpoints hold caller phone numbers, so the directory is 0700 and the
+// file 0600. Node's defaults are 0777 and 0666 before umask, which on a
+// common 022 leaves both world readable.
 const DEFAULT_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'data', 'sessions.json');
 
 function storePath(): string {
@@ -141,13 +144,15 @@ async function readStore(path: string): Promise<StoreFile> {
 }
 
 async function writeStore(path: string, data: StoreFile): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
+  // Checkpoints hold caller phone numbers. Node defaults to 0777 and 0666
+  // before umask, which on a common 022 leaves both world readable.
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   // Write beside the real file, then rename over it. rename() is atomic on
   // the same filesystem, so a reader (or a second writer) never observes a
   // half-written file. The random suffix means two overlapping writers
   // never share, and so never race on, the same temp file.
   const tmp = `${path}.${randomBytes(6).toString('hex')}.tmp`;
-  await writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
+  await writeFile(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
   await rename(tmp, path);
 }
 

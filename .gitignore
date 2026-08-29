@@ -7,7 +7,8 @@ dist/
 build/
 .next/
 *.log
-data/*.sqlite
+# Session checkpoints hold caller phone numbers. Never committed.
+data/
 .tunnel-url
 
 # agent worktrees, never part of the repo
