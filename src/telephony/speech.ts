@@ -76,6 +76,21 @@ function couldBecomeFiller(text: string): boolean {
  */
 const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
 
+/**
+ * Money the agent wrote without a dollar sign.
+ *
+ * Measured live: an approved offer read "the net comes to 13,481.12" with no
+ * sign, so the currency rule missed it and the bare-decimal rule below spoke
+ * it as "13,481 point 12". That is the same stumble the dollar rule exists to
+ * prevent, reached through a different door, and the model writes the figure
+ * either way.
+ *
+ * Thousands separators plus exactly two decimals is the signal. A percentage
+ * ("78.6"), a rate ("0.085") and a plain count all miss it, so nothing that is
+ * not an amount gets spoken as one.
+ */
+const BARE_MONEY = /(?<![$\d.])(\d{1,3}(?:,\d{3})+)\.(\d{2})(?!\d)/g;
+
 /** "085" as "0 8 5", so a fraction is not read as the number eighty five. */
 function spelled(digits: string): string {
   return digits.split('').join(' ');
@@ -105,6 +120,12 @@ export function speakNumbers(text: string): string {
       // the fraction keeps that the same either way.
       const cents = fraction === undefined ? 0 : Number(fraction.padEnd(2, '0'));
       const unit = oneDollar ? 'dollar' : 'dollars';
+      if (cents === 0) return `${whole} ${unit}`;
+      return `${whole} ${unit} and ${cents} ${cents === 1 ? 'cent' : 'cents'}`;
+    })
+    .replace(BARE_MONEY, (_match, whole: string, fraction: string) => {
+      const cents = Number(fraction);
+      const unit = whole === '1' ? 'dollar' : 'dollars';
       if (cents === 0) return `${whole} ${unit}`;
       return `${whole} ${unit} and ${cents} ${cents === 1 ? 'cent' : 'cents'}`;
     })

@@ -297,3 +297,35 @@ test('a turn with no text at all yields nothing rather than a stray space', asyn
   ]);
   assert.equal(spoken, '');
 });
+
+/**
+ * Money the model wrote without a dollar sign.
+ *
+ * Captured on the deployed stack: an approved offer read "the net comes to
+ * 13,481.12" and the caller heard "13,481 point 12". The currency rule wanted
+ * a dollar sign the model had not written.
+ */
+test('a bare thousands-and-cents figure is spoken as money, not as "point"', () => {
+  assert.equal(
+    speakNumbers('It is showing as a total loss, and the net comes to 13,481.12.'),
+    'It is showing as a total loss, and the net comes to 13,481 dollars and 12 cents.',
+  );
+  assert.equal(speakNumbers('1,000.00 deductible'), '1,000 dollars deductible');
+});
+
+test('the bare money rule leaves anything that is not an amount alone', () => {
+  // A percentage, a per-mile rate and a plain threshold all have to survive it,
+  // or the console starts reading rates as settlements.
+  assert.equal(speakNumbers('loss ratio is 78.6 percent'), 'loss ratio is 78 point 6 percent');
+  assert.equal(speakNumbers('the rate is $0.085 per mile'), 'the rate is 0 point 0 8 5 dollars per mile');
+  assert.equal(speakNumbers('threshold is 75'), 'threshold is 75');
+});
+
+test('a bare figure keeps its digits exactly, the same as a signed one', () => {
+  // The whole point of the shaper: an approved amount may be reworded for a
+  // phone voice, never changed.
+  const spoken = speakNumbers('the net comes to 13,481.12');
+  assert.ok(spoken.includes('13,481'), spoken);
+  assert.ok(spoken.includes('12 cents'), spoken);
+  assert.ok(!spoken.includes('point'), spoken);
+});
