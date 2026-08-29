@@ -440,6 +440,42 @@ test('a gate round never recurses without bound', async () => {
   });
 });
 
+test('a flood of other callers cannot evict the caller on the line', async () => {
+  // Eviction here fails open, not closed: with no binding amounts on file
+  // there is nothing to compare speech against, so the figure is released.
+  // The caller on the line therefore has to stay the newest entry.
+  await withStore(async () => {
+    // Turn one calculates the settlement. Every later turn only talks, so
+    // the hold depends on the amount being REMEMBERED rather than relearned
+    // from a tool response that happens to repeat.
+    const calculates = [
+      message('m1'),
+      SETTLEMENT_RESPONSE as unknown as TurnEvent,
+      message('m2'),
+      delta('m2', 'Let me run the numbers.'),
+      done(),
+    ];
+    const justTalks = [
+      message('m1'),
+      delta('m1', 'The settlement is $13,481.12.'),
+      done(),
+    ];
+    const forge = stubForge({
+      turns: [calculates, ...Array(700).fill(justTalks)],
+    });
+    const bridge = createBridge({ forge: forge.client, agentName: 'northvane' });
+
+    await speak(bridge.runTurn('what is the payout', CALLER));
+    // 600 other numbers ring in, past the 500 the maps hold.
+    for (let i = 0; i < 600; i++) {
+      await speak(bridge.runTurn('hello', `+1666000${String(i).padStart(4, '0')}`));
+    }
+    // The original caller is still on the line and still held.
+    const said = await speak(bridge.runTurn('so what is it', CALLER));
+    assert.doesNotMatch(said, /13[,.]481/, 'eviction released an unapproved figure');
+  });
+});
+
 test('every gate has a waiter before any of them is announced', async () => {
   // Announcing first and awaiting one at a time made a gate visible to an
   // operator with nothing listening for its answer, so a decision on the

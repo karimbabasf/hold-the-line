@@ -212,29 +212,49 @@ export function createBridge(opts: BridgeOptions) {
    * `authorisedAmountsByClaim` in src/mcp/gated.ts was already fixed for
    * once. A resumed call keeps both lists, because it is the same call.
    *
-   * Bounded for the same reason `sessions` is: a phone line runs for months
-   * and every caller who ever rings would otherwise add an entry that is
-   * never removed.
+   * Bounded by age rather than by count, for the reason `amountsFor` gives.
    */
-  const bindingByCaller = new Map<string, number[]>();
-  const authorisedByCaller = new Map<string, number[]>();
-  const listFor = (m: Map<string, number[]>, callerId: string): number[] => {
-    const existing = m.get(callerId);
-    if (existing) return existing;
-    const fresh: number[] = [];
-    m.set(callerId, fresh);
-    while (m.size > MAX_LIVE_SESSIONS) {
-      const oldest = m.keys().next().value;
-      if (oldest === undefined) break;
-      m.delete(oldest);
+  interface CallAmounts {
+    /** Last touched, so an entry can be aged out rather than counted out. */
+    at: number;
+    /** Amounts a tool has said commit Northvane to something. */
+    binding: number[];
+    /** Of those, the ones an operator has approved. */
+    authorised: number[];
+  }
+  const amountsByCaller = new Map<string, CallAmounts>();
+
+  /**
+   * A caller's amounts, aging out entries no live call can still need.
+   *
+   * Deliberately NOT a count-bounded cache. Evicting the oldest entry would
+   * fail OPEN, not closed: with no binding amounts on file there is nothing
+   * to compare speech against, so an unapproved figure gets released. And a
+   * caller sitting quietly through somebody else's five hundred calls is
+   * still on the line. Age is the honest bound instead. Past the resume
+   * window the call cannot be picked back up at all, so dropping the entry
+   * cannot affect a call in progress.
+   */
+  function amountsFor(callerId: string): CallAmounts {
+    const now = Date.now();
+    const found = amountsByCaller.get(callerId) ?? {
+      at: now,
+      binding: [],
+      authorised: [],
+    };
+    found.at = now;
+    amountsByCaller.set(callerId, found);
+    for (const [id, entry] of amountsByCaller) {
+      if (id !== callerId && now - entry.at > resumeWindowMs) {
+        amountsByCaller.delete(id);
+      }
     }
-    return fresh;
-  };
+    return found;
+  }
 
   /** Starts a caller's amounts over. A new call has authorised nothing. */
   function forgetAmounts(callerId: string): void {
-    bindingByCaller.delete(callerId);
-    authorisedByCaller.delete(callerId);
+    amountsByCaller.delete(callerId);
   }
 
   /**
@@ -271,8 +291,7 @@ export function createBridge(opts: BridgeOptions) {
     round: number,
     shaper: SpeechShaper,
   ): AsyncGenerator<TurnDelta> {
-    const binding = listFor(bindingByCaller, callerId);
-    const authorised = listFor(authorisedByCaller, callerId);
+    const { binding, authorised } = amountsFor(callerId);
 
     /** Text a caller is allowed to hear, or '' when it is not. Withholds the
      *  whole message rather than editing the number out of it: a redacted
