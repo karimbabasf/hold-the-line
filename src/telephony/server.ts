@@ -6,10 +6,8 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { stripTypeScriptTypes } from 'node:module';
-import { dirname, extname, join, normalize } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { encodeSSE, type ConsoleEvent } from '../console/events.ts';
@@ -17,6 +15,7 @@ import { TrueForgeClient } from '../trueforge/client.ts';
 import type { ApprovalDecision, ResolvedGate } from '../trueforge/types.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
 import { createBridge } from './harness-bridge.ts';
+import { createRouter, type RouteResponse } from './router.ts';
 
 /**
  * The endpoint is on a public tunnel, so it authenticates.
@@ -38,20 +37,11 @@ const MAX_BODY_BYTES = 64 * 1024;
 
 const CONSOLE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'console');
 
-const CONTENT_TYPES: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.woff2': 'font/woff2',
-  '.png': 'image/png',
-  '.json': 'application/json; charset=utf-8',
-};
-
 const PORT = Number(process.env.PORT ?? 8791);
 const AGENT_NAME = process.env.TRUEFORGE_AGENT ?? 'northvane';
 const TRUEFORGE_BASE_URL = process.env.TRUEFORGE_BASE_URL ?? 'http://localhost:8790';
 
-const sseClients = new Set<ServerResponse>();
+const sseClients = new Set<RouteResponse>();
 let sseSeq = 0;
 
 function broadcast(event: ConsoleEvent): void {
@@ -145,31 +135,35 @@ const bridge = createBridge({
 const chat = createChatEndpoint({ runTurn: bridge.runTurn });
 
 /**
- * Wraps a Node request as a Fetch Request, carrying the hangup with it.
+ * One decision on one held gate, from a request body.
  *
- * `close` on the response with nothing finished is the socket going away,
- * which on a phone line is the call ending mid-sentence. The endpoint reads
- * that off `req.signal` to refuse a turn for a caller who is already gone.
- * It is not the only path: a Request's signal follows the controller passed
- * to it and stopped firing once the request object was no longer referenced,
- * so the dispatch below also cancels the response reader, which is what
- * reliably reaches a turn already in flight.
+ * Only the exact strings "allow" and "deny" settle a gate. Anything else, a
+ * missing status included, is not a decision and releases nothing: there is
+ * no path here from an unparseable body to a caller hearing a binding
+ * sentence.
  */
-function toRequest(req: IncomingMessage, res: ServerResponse, body: string): Request {
-  const headers = new Headers();
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (typeof v === 'string') headers.set(k, v);
+function decideFromBody(raw: string): { status: number; body: unknown } {
+  let body: { id?: unknown; status?: unknown; reason?: unknown };
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return { status: 400, body: { error: 'body was not valid JSON' } };
   }
-  const gone = new AbortController();
-  res.on('close', () => {
-    if (!res.writableFinished) gone.abort(new Error('client closed the connection'));
-  });
-  return new Request(`http://localhost:${PORT}${req.url ?? '/'}`, {
-    method: req.method ?? 'GET',
-    headers,
-    signal: gone.signal,
-    ...(req.method === 'GET' || req.method === 'HEAD' ? {} : { body }),
-  });
+  const allowed = body.status === 'allow';
+  const denied = body.status === 'deny';
+  if (typeof body.id !== 'string' || (!allowed && !denied)) {
+    return { status: 400, body: { error: 'expected {id, status: "allow" | "deny", reason?}' } };
+  }
+  const decision: ApprovalDecision = allowed
+    ? { status: 'allow' }
+    : {
+        status: 'deny',
+        ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
+      };
+  const settled = decideGate(body.id, decision);
+  return settled
+    ? { status: 200, body: { ok: true } }
+    : { status: 404, body: { error: 'no gate is waiting on that id' } };
 }
 
 /** Constant-time compare so a wrong token cannot be found byte by byte. */
@@ -182,6 +176,22 @@ function secretMatches(header: string | undefined): boolean {
   // worth hiding here, so it is checked first.
   return a.length === b.length && timingSafeEqual(a, b);
 }
+
+const handle = createRouter({
+  chat,
+  secretMatches,
+  consoleDir: CONSOLE_DIR,
+  agentName: AGENT_NAME,
+  origin: `http://localhost:${PORT}`,
+  sse: {
+    attach: (sink) => { sseClients.add(sink); },
+    detach: (sink) => { sseClients.delete(sink); },
+  },
+  gate: {
+    pending: () => [...pendingGates.values()],
+    decide: decideFromBody,
+  },
+});
 
 const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   const chunks: Buffer[] = [];
@@ -204,167 +214,53 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
 
   req.on('end', () => {
     if (tooLarge) return;
-    void (async () => {
-      const raw = req.url ?? '/';
-      // Route on the path alone. `req.url` carries the query string, so
-      // comparing it directly sent every documented console mode
-      // (?demo, ?speed, ?until, ?live) down the 404 branch.
-      const url = raw.split('?')[0] ?? '/';
-      console.log(`${req.method} ${raw}`);
+    const raw = req.url ?? '/';
+    console.log(`${req.method} ${raw}`);
 
-      if (url === '/sse') {
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          'connection': 'keep-alive',
-        });
-        sseClients.add(res);
-        req.on('close', () => { sseClients.delete(res); });
+    const headers: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      headers[k] = typeof v === 'string' ? v : Array.isArray(v) ? v[0] : undefined;
+    }
+
+    // The socket closing before the response finished is the caller hanging
+    // up. Latched, because a listener registered after that has happened
+    // still has to run: the chat route adds one after awaiting the harness.
+    let aborted = false;
+    const abortListeners: Array<() => void> = [];
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      aborted = true;
+      for (const fn of abortListeners.splice(0)) fn();
+    });
+
+    // One sink per request, so its identity is stable: the SSE hub keys a
+    // live client on it.
+    const sink: RouteResponse = {
+      writeHead: (status, h) => { res.writeHead(status, h ?? {}); },
+      write: (chunk) => { res.write(chunk); },
+      end: (chunk) => { chunk === undefined ? res.end() : res.end(chunk); },
+      writable: () => !res.writableEnded && !res.destroyed,
+    };
+
+    void handle(
+      {
+        method: req.method ?? 'GET',
+        url: raw,
+        headers,
+        body: Buffer.concat(chunks).toString('utf8'),
+        onClose: (fn) => { res.on('close', fn); },
+        onAborted: (fn) => { if (aborted) fn(); else abortListeners.push(fn); },
+      },
+      sink,
+    ).catch((err: unknown) => {
+      console.error('request handling failed:', err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'internal error' }));
         return;
       }
-
-      // The operator console, served straight from source.
-      //
-      // Browsers cannot run TypeScript, so the .ts modules have their types
-      // stripped on the way out rather than built ahead of time. A build step
-      // is one more thing to forget on the morning of a demo, and there is
-      // nothing here that needs bundling.
-      if (url === '/console' || url.startsWith('/console/')) {
-        const rel = url === '/console' ? 'index.html' : url.slice('/console/'.length);
-        // Reject anything that climbs out of the console directory.
-        const safe = normalize(rel).replace(/^(\.\.[/\\])+/, '');
-        const file = join(CONSOLE_DIR, safe);
-        if (!file.startsWith(CONSOLE_DIR)) {
-          res.writeHead(403).end('forbidden');
-          return;
-        }
-        try {
-          const ext = extname(file);
-          if (ext === '.ts') {
-            const src = await readFile(file, 'utf8');
-            res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' });
-            // Import specifiers keep their .ts extension in source; the
-            // browser has to ask for the same paths this route serves.
-            res.end(stripTypeScriptTypes(src, { mode: 'strip' }));
-            return;
-          }
-          const body = await readFile(file);
-          res.writeHead(200, { 'content-type': CONTENT_TYPES[ext] ?? 'application/octet-stream' });
-          res.end(body);
-          return;
-        } catch {
-          res.writeHead(404).end('not found');
-          return;
-        }
-      }
-
-      if (url === '/health') {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, agent: AGENT_NAME }));
-        return;
-      }
-
-      // The release for a held gate. Authenticated with the same shared
-      // secret as the chat endpoint: whoever can reach this can decide what
-      // a caller hears, so it is not left open on a public tunnel.
-      if (url === '/gate/pending' || url === '/gate/decide') {
-        if (!secretMatches(req.headers.authorization)) {
-          res.writeHead(401, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'unauthorized' }));
-          return;
-        }
-
-        if (url === '/gate/pending' && req.method === 'GET') {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify([...pendingGates.values()]));
-          return;
-        }
-
-        if (url === '/gate/decide' && req.method === 'POST') {
-          let body: { id?: unknown; status?: unknown; reason?: unknown };
-          try {
-            body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          } catch {
-            res.writeHead(400, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ error: 'body was not valid JSON' }));
-            return;
-          }
-          // Only these two words settle a gate. Anything else, including a
-          // missing status, is not a decision and releases nothing.
-          const allowed = body.status === 'allow';
-          const denied = body.status === 'deny';
-          if (typeof body.id !== 'string' || (!allowed && !denied)) {
-            res.writeHead(400, { 'content-type': 'application/json' });
-            res.end(
-              JSON.stringify({ error: 'expected {id, status: "allow" | "deny", reason?}' }),
-            );
-            return;
-          }
-          const decision: ApprovalDecision = allowed
-            ? { status: 'allow' }
-            : {
-                status: 'deny',
-                ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
-              };
-          const settled = decideGate(body.id, decision);
-          res.writeHead(settled ? 200 : 404, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(settled ? { ok: true } : { error: 'no gate is waiting on that id' }));
-          return;
-        }
-
-        res.writeHead(405).end('method not allowed');
-        return;
-      }
-
-      // Exact, not a prefix: the query string is already stripped above, so a
-      // prefix match let paths under this one through to the chat handler.
-      if (url !== '/v1/chat/completions') {
-        res.writeHead(404).end('not found');
-        return;
-      }
-
-      if (!secretMatches(req.headers.authorization)) {
-        console.warn('rejected an unauthenticated request');
-        res.writeHead(401, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'unauthorized' }));
-        return;
-      }
-
-      const response = await chat(
-        toRequest(req, res, Buffer.concat(chunks).toString('utf8')),
-      );
-
-      res.writeHead(response.status, Object.fromEntries(response.headers));
-      if (!response.body) {
-        res.end();
-        return;
-      }
-      // Read rather than for-await, so a socket that has gone away stops the
-      // loop and cancels the stream instead of writing into nothing for the
-      // rest of the turn.
-      const reader = (response.body as ReadableStream<Uint8Array>).getReader();
-      // Cancelling the reader is what actually reaches the turn. The signal on
-      // the Request is a follower of the controller above and does not
-      // reliably fire once the request object is no longer referenced, which
-      // showed up live as a gate that stayed held after the caller hung up.
-      // This path is direct: socket closed, stream cancelled, turn told.
-      res.on('close', () => {
-        if (!res.writableFinished) {
-          void reader.cancel(new Error('client closed the connection')).catch(() => {});
-        }
-      });
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (res.writableEnded || res.destroyed) break;
-          res.write(value);
-        }
-      } finally {
-        await reader.cancel().catch(() => {});
-      }
-      if (!res.writableEnded && !res.destroyed) res.end();
-    })();
+      res.destroy();
+    });
   });
 });
 
