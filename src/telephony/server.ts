@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 import { encodeSSE, type ConsoleEvent } from '../console/events.ts';
 import { TrueForgeClient } from '../trueforge/client.ts';
+import type { ApprovalDecision, ResolvedGate } from '../trueforge/types.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
 import { createBridge } from './harness-bridge.ts';
 
@@ -62,28 +63,54 @@ function broadcast(event: ConsoleEvent): void {
 
 let currentCallStart = Date.now();
 
+/**
+ * Gates the bridge is holding, and the promises waiting on them.
+ *
+ * The bridge stops speaking the moment a gate opens and resumes only when a
+ * decision arrives, so this map is the release. It lives here rather than in
+ * the console because the console is a browser page: the decision has to
+ * reach the process that holds the caller's stream.
+ */
+const pendingGates = new Map<string, ResolvedGate>();
+const waiting = new Map<string, (d: ApprovalDecision | null) => void>();
+
+/** Settles one held gate. Returns false when nothing was waiting on it, so a
+ *  replayed or stale decision cannot look like it worked. */
+function decideGate(id: string, decision: ApprovalDecision | null): boolean {
+  const settle = waiting.get(id);
+  if (!settle) return false;
+  waiting.delete(id);
+  pendingGates.delete(id);
+  settle(decision);
+  return true;
+}
+
 const bridge = createBridge({
   forge: new TrueForgeClient({ baseUrl: TRUEFORGE_BASE_URL }),
   agentName: AGENT_NAME,
-  onApprovalRequired: (event, _callerId) => {
-    console.log('[gate] approval required:', JSON.stringify(event.tool_calls));
-    const t = Date.now() - currentCallStart;
-    for (const tc of event.tool_calls) {
-      const args = tc.arguments as Record<string, unknown> | undefined;
-      const toolName = (args?.tool_name as string) ?? tc.name ?? 'unknown';
-      const input = args?.input as Record<string, unknown> | undefined;
-      const utterance = input?.utterance;
-      const gateEvent: ConsoleEvent = {
-        type: 'gate',
-        t,
-        id: tc.id,
-        tool: toolName,
-        status: 'opened',
-        ...(typeof utterance === 'string' ? { wanted: utterance } : {}),
-      };
-      broadcast(gateEvent);
-    }
+  onApprovalRequired: (gate, _callerId) => {
+    console.log(`[gate] approval required: ${gate.tool} ${gate.tool_call_id}`);
+    pendingGates.set(gate.tool_call_id, gate);
+    broadcast({
+      type: 'gate',
+      t: Date.now() - currentCallStart,
+      id: gate.tool_call_id,
+      tool: gate.tool,
+      status: 'opened',
+      ...(gate.utterance === undefined ? {} : { wanted: gate.utterance }),
+      ...(gate.claim_id === undefined ? {} : { claim_id: gate.claim_id }),
+      ...(gate.authorised_amounts === undefined
+        ? {}
+        : { authorised_amounts: gate.authorised_amounts }),
+    } satisfies ConsoleEvent);
   },
+  awaitApproval: (gate) =>
+    new Promise<ApprovalDecision | null>((settle) => {
+      // Held until a human posts to /gate/decide. There is no timer here on
+      // purpose: an operator who never decides leaves the caller hearing
+      // nothing, which is the outcome this product exists to guarantee.
+      waiting.set(gate.tool_call_id, settle);
+    }),
   onConsoleEvent: (event) => {
     if (event.type === 'call' && event.status === 'started') {
       currentCallStart = Date.now();
@@ -191,6 +218,58 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       if (url === '/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, agent: AGENT_NAME }));
+        return;
+      }
+
+      // The release for a held gate. Authenticated with the same shared
+      // secret as the chat endpoint: whoever can reach this can decide what
+      // a caller hears, so it is not left open on a public tunnel.
+      if (url === '/gate/pending' || url === '/gate/decide') {
+        if (!secretMatches(req.headers.authorization)) {
+          res.writeHead(401, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unauthorized' }));
+          return;
+        }
+
+        if (url === '/gate/pending' && req.method === 'GET') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify([...pendingGates.values()]));
+          return;
+        }
+
+        if (url === '/gate/decide' && req.method === 'POST') {
+          let body: { id?: unknown; status?: unknown; reason?: unknown };
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'body was not valid JSON' }));
+            return;
+          }
+          // Only these two words settle a gate. Anything else, including a
+          // missing status, is not a decision and releases nothing.
+          const allowed = body.status === 'allow';
+          const denied = body.status === 'deny';
+          if (typeof body.id !== 'string' || (!allowed && !denied)) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(
+              JSON.stringify({ error: 'expected {id, status: "allow" | "deny", reason?}' }),
+            );
+            return;
+          }
+          const decision: ApprovalDecision = allowed
+            ? { status: 'allow' }
+            : {
+                status: 'deny',
+                ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
+              };
+          const settled = decideGate(body.id, decision);
+          res.writeHead(settled ? 200 : 404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(settled ? { ok: true } : { error: 'no gate is waiting on that id' }));
+          return;
+        }
+
+        res.writeHead(405).end('method not allowed');
         return;
       }
 

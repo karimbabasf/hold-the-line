@@ -10,17 +10,40 @@
 import type { ConsoleEvent } from '../console/events.ts';
 import { checkpoint, resume } from '../session/store.ts';
 import type { TrueForgeClient } from '../trueforge/client.ts';
-import { isApprovalRequired, type ToolApprovalRequiredEvent } from '../trueforge/types.ts';
+import {
+  isApprovalRequired,
+  resolveGate,
+  type ApprovalDecision,
+  type ResolvedGate,
+  type ToolApprovalRequiredEvent,
+  type TurnInputItem,
+} from '../trueforge/types.ts';
+import { bindingAmountsFrom, unauthorisedAmounts } from './binding-amounts.ts';
 import type { TurnDelta } from './chat-endpoint.ts';
-import { createSpeechShaper } from './speech.ts';
+import { createSpeechShaper, type SpeechShaper } from './speech.ts';
 
 export interface BridgeOptions {
   forge: TrueForgeClient;
   agentName: string;
-  /** Called when the harness parks a gated tool call. Receives the full
-   *  approval event and the caller id so the console can build a gate event
-   *  with the right tool name and timing. */
-  onApprovalRequired?: (event: ToolApprovalRequiredEvent, callerId: string) => void;
+  /** Called when the harness parks a gated tool call, with the tool name and
+   *  the draft utterance already resolved off the source event. The console
+   *  renders this, so an operator judges the sentence rather than a call id. */
+  onApprovalRequired?: (gate: ResolvedGate, callerId: string) => void;
+  /**
+   * Waits for an operator's decision on a held gate.
+   *
+   * Resolving to null means no decision was made, and the correct outcome of
+   * no decision is silence: the turn speaks nothing further. There is no
+   * timeout that approves and no default-allow, because a gate that opens
+   * itself is not a gate.
+   *
+   * Leaving this unset is also fail-closed. The bridge holds, reports the
+   * gate, and speaks nothing more that turn.
+   */
+  awaitApproval?: (
+    gate: ResolvedGate,
+    callerId: string,
+  ) => Promise<ApprovalDecision | null>;
   /** Called with every console event the bridge emits (call start, session
    *  resume). The server broadcasts these to SSE clients. */
   onConsoleEvent?: (event: ConsoleEvent) => void;
@@ -59,6 +82,33 @@ export function extractText(event: { type: string; [k: string]: unknown }): stri
  */
 export function isMessageStart(event: { type: string }): boolean {
   return event.type === 'model.message';
+}
+
+/**
+ * The seam between the gate and the voice.
+ *
+ * The gate decides WHETHER a message may be spoken and the shaper decides
+ * HOW it sounds, in that order and never the other way round. The gate reads
+ * the harness's own words, so what it judges is what the agent actually
+ * asked to say, not a rewritten copy of it.
+ *
+ * The shaper does change the words: `offer.state_settlement` returns the
+ * sentence an operator approved and "$13,481.12" leaves here as "13,481
+ * dollars and 12 cents", because raw currency reaches TTS as "dot one two".
+ * That rewrite is only ever cosmetic. speech.ts copies digits through
+ * untouched and replaces only the symbols around them, so the amount spoken
+ * is provably the amount approved. test/approval-gate.test.ts pins that: a
+ * shaper that rounded or dropped a digit of an approved figure would be the
+ * same class of failure as speaking an unapproved one.
+ */
+function* speakOut(shaper: SpeechShaper, text: string): Generator<TurnDelta> {
+  // Opens this message and releases whatever the last one still held. Only
+  // messages that pass the gate ever open, so a withheld message leaves no
+  // trace in the shaper's spacing or its filler memory.
+  const flushed = shaper.startMessage();
+  if (flushed) yield { type: 'message.delta', text: flushed };
+  const spoken = shaper.push(text);
+  if (spoken) yield { type: 'message.delta', text: spoken };
 }
 
 export function createBridge(opts: BridgeOptions) {
@@ -151,6 +201,171 @@ export function createBridge(opts: BridgeOptions) {
   /** Turns completed per caller, so transcript_index means what it says. */
   const turnsSeen = new Map<string, number>();
 
+  /**
+   * What each caller's settlement is worth, and what an operator has
+   * actually let the agent say out loud. Per caller, because one figure
+   * being approved on one claim must never make it speakable on another.
+   */
+  const bindingByCaller = new Map<string, number[]>();
+  const authorisedByCaller = new Map<string, number[]>();
+  const listFor = (m: Map<string, number[]>, callerId: string): number[] => {
+    const existing = m.get(callerId);
+    if (existing) return existing;
+    const fresh: number[] = [];
+    m.set(callerId, fresh);
+    return fresh;
+  };
+
+  /**
+   * How many times one caller turn may go round the gate before the bridge
+   * stops. A denial makes the agent redraft and ask again, which is the
+   * point, but an agent that redrafts forever would recurse forever. Hitting
+   * the cap speaks nothing: the failure mode stays silence, never speech.
+   */
+  const MAX_GATE_ROUNDS = 4;
+
+  /**
+   * Streams one turn, holding speech until it is provably safe to say.
+   *
+   * Two things are held, for two different reasons.
+   *
+   * Structural: text is buffered per `model.message` and released only when
+   * the next message opens or the turn ends clean. A gated call is announced
+   * after its message's words have already streamed, so releasing them live
+   * would put the agent's own draft in the caller's ear a beat before the
+   * operator is even asked. Once an approval is pending nothing further is
+   * released at all, whatever the harness goes on to send.
+   *
+   * By amount: the structural hold only catches sentences the agent routed
+   * through a gated tool. Captured live on 2026-08-29, across eight runs of
+   * the same caller turn, it did not always route them. Twice the net
+   * settlement was stated as prose in a message before the gate, and twice
+   * in a turn with no gate at all. So the settlement figure itself is held
+   * until an operator authorises it. See binding-amounts.ts.
+   */
+  async function* runGuarded(
+    sessionId: string,
+    input: TurnInputItem[],
+    callerId: string,
+    round: number,
+    shaper: SpeechShaper,
+  ): AsyncGenerator<TurnDelta> {
+    const binding = listFor(bindingByCaller, callerId);
+    const authorised = listFor(authorisedByCaller, callerId);
+
+    /** Text a caller is allowed to hear, or '' when it is not. Withholds the
+     *  whole message rather than editing the number out of it: a redacted
+     *  sentence is not a sentence anyone should say on a phone call. */
+    const releasable = (text: string): string => {
+      if (!text) return '';
+      const blocked = unauthorisedAmounts(text, binding, authorised);
+      if (blocked.length === 0) return text;
+      console.error(
+        `[gate] withheld speech carrying an unauthorised settlement figure: ${blocked.join(', ')}`,
+      );
+      return '';
+    };
+
+    let openMessageId: string | null = null;
+    let buffer = '';
+    let pending: ToolApprovalRequiredEvent | null = null;
+
+    for await (const event of opts.forge.streamTurn(sessionId, input)) {
+      if (isApprovalRequired(event)) {
+        // Never auto-approved here. Auto-approving would defeat the entire
+        // point of the project.
+        pending = event;
+        const gated = event.tool_calls.map((c) => c.source_event_id);
+        if (openMessageId && !gated.includes(openMessageId)) {
+          // Live, the gated call is always the open message, and the turn
+          // ends on it. If that ever stops holding, an earlier message has
+          // already been spoken and this is the only place it would show.
+          console.error(
+            `[gate] approval named ${gated.join(', ')} but the open message was ${openMessageId}`,
+          );
+        }
+        // The agent's own draft goes no further.
+        buffer = '';
+        continue;
+      }
+
+      // Speech is locked for the rest of the turn. The live harness ends the
+      // turn here, but the lock does not depend on that.
+      if (pending) continue;
+
+      if (event.type === 'tool.response') {
+        for (const amount of bindingAmountsFrom(
+          (event as { content?: unknown }).content,
+        )) {
+          if (!binding.includes(amount)) binding.push(amount);
+        }
+        continue;
+      }
+
+      if (event.type === 'model.message') {
+        // The previous message closed without a gate, so it can be spoken.
+        const out = releasable(buffer);
+        if (out) yield* speakOut(shaper, out);
+        buffer = '';
+        const id = (event as { id?: unknown }).id;
+        openMessageId = typeof id === 'string' ? id : null;
+        continue;
+      }
+
+      const text = extractText(event);
+      if (text) buffer += text;
+    }
+
+    if (!pending) {
+      const out = releasable(buffer);
+      if (out) yield* speakOut(shaper, out);
+      return;
+    }
+
+    // Held. Describe every gate, wait for every decision, resume only when
+    // all of them came back.
+    const gates: ResolvedGate[] = [];
+    for (const ref of pending.tool_calls) {
+      const source = ref.source_event_id
+        ? await opts.forge.findEvent(sessionId, ref.source_event_id)
+        : undefined;
+      const gate = resolveGate(ref, pending.thread_id, source);
+      gates.push(gate);
+      opts.onApprovalRequired?.(gate, callerId);
+    }
+
+    if (!opts.awaitApproval) {
+      console.warn(
+        '[gate] held with no approval channel wired. Nothing more is spoken this turn.',
+      );
+      return;
+    }
+    if (round >= MAX_GATE_ROUNDS) {
+      console.error(`[gate] gave up after ${MAX_GATE_ROUNDS} rounds without a settled gate`);
+      return;
+    }
+
+    const resumeInput: TurnInputItem[] = [];
+    for (const gate of gates) {
+      const decision = await opts.awaitApproval(gate, callerId);
+      // No decision is not a decision to allow. Speak nothing.
+      if (!decision) return;
+      if (decision.status === 'allow') {
+        for (const amount of gate.authorised_amounts ?? []) {
+          if (!authorised.includes(amount)) authorised.push(amount);
+        }
+      }
+      resumeInput.push({
+        type: 'user.tool_approval',
+        thread_id: gate.thread_id,
+        tool_call_id: gate.tool_call_id,
+        approval: decision,
+      });
+    }
+
+    yield* runGuarded(sessionId, resumeInput, callerId, round + 1, shaper);
+  }
+
   return {
     sessions,
     wasResumed,
@@ -191,33 +406,19 @@ export function createBridge(opts: BridgeOptions) {
       // One shaper per turn. It owns everything between the harness and the
       // caller's ear: the space between two messages, the repeated filler, and
       // the figures. See speech.ts for why each of those is here.
+      //
+      // It spans the gate rounds too, not just the first pass, because a turn
+      // that parks on an approval and resumes is still one turn to the caller:
+      // a filler already said before the gate must not be said again after it.
       const shaper = createSpeechShaper();
 
-      for await (const event of opts.forge.streamTurn(sessionId, [
-        { type: 'user.message', content },
-      ])) {
-        if (isApprovalRequired(event)) {
-          // Never auto-approved here. Auto-approving would defeat the entire
-          // point of the project.
-          opts.onApprovalRequired?.(event, callerId);
-          continue;
-        }
-
-        // Each tool round opens its own message. Without this the last word of
-        // one round and the first word of the next arrive glued together and
-        // TTS reads the period as a stumble.
-        if (isMessageStart(event)) {
-          const flushed = shaper.startMessage();
-          if (flushed) yield { type: 'message.delta', text: flushed };
-          continue;
-        }
-
-        const text = extractText(event);
-        if (text) {
-          const spoken = shaper.push(text);
-          if (spoken) yield { type: 'message.delta', text: spoken };
-        }
-      }
+      yield* runGuarded(
+        sessionId,
+        [{ type: 'user.message', content }],
+        callerId,
+        0,
+        shaper,
+      );
 
       const tail = shaper.end();
       if (tail) yield { type: 'message.delta', text: tail };

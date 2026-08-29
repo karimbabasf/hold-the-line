@@ -124,15 +124,29 @@ export interface GateEvent {
   /** Stable id for one gate's lifecycle, opened through its resolution.
    *  Live, this is TrueForge's `tool_calls[].id` for the approval. */
   id: string;
-  /** The gated tool this approval is for, e.g. `"offer.state_settlement"`
-   *  or `"settlement.accept"`. Live, this is `arguments.tool_name` off the
-   *  `call_tool` envelope, never the envelope's own `name`, which is always
-   *  the literal string `"call_tool"`. Present on every status, not only
-   *  `'opened'`, so a client never has to remember it across a gap. */
+  /**
+   * The gated tool this approval is for, e.g. `"offer.state_settlement"`.
+   * Present on every status, not only `'opened'`, so a client never has to
+   * remember it across a gap.
+   *
+   * Live, this does NOT come off the approval event. Captured on
+   * 2026-08-29, that event carries only `id` and `source_event_id` per tool
+   * call: no `name`, no `arguments`. The tool name is `tool_name` inside the
+   * `call_tool` envelope on the `model.message` that `source_event_id`
+   * points at, and that envelope's `arguments` is a JSON string rather than
+   * an object. `resolveGate` in src/trueforge/types.ts does the unwrapping.
+   * The envelope's own `name` is always the literal `"call_tool"` and is
+   * never what belongs here.
+   */
   tool: string;
   status: 'opened' | 'sent_back' | 'approved';
-  /** The draft utterance. Present on `'opened'`. */
+  /** The draft utterance. Present on `'opened'`. Live, this is
+   *  `input.utterance` inside the same `call_tool` envelope as `tool`. */
   wanted?: string;
+  /** The claim the gate is on. Present on `'opened'` when the draft named
+   *  one, so an operator can post the final wording against the right
+   *  claim. */
+  claim_id?: string;
   /** What was actually spoken. Present on `'approved'`. */
   said?: string;
   /** The settlement breakdown beside the draft. Present on `'opened'`. */
