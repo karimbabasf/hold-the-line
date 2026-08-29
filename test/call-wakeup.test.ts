@@ -123,3 +123,22 @@ test('the status callback ends a call with no caller id of its own', () => {
     1,
   );
 });
+
+test('an end with no call showing is not held against the next call', () => {
+  const live = createLiveConsole();
+
+  // What the status callback route guards on. A `completed` for a leg that
+  // never connected, or for a call this process was restarted out of, must
+  // not be forwarded: `callEnded` with no call clock is held as a pending
+  // end and applied to whatever starts next.
+  assert.equal(live.onCall(), false);
+
+  const seen = watch(live);
+  live.callStarted('+14155550101', '+14155550101');
+  assert.equal(live.onCall(), true);
+  assert.equal(
+    seen.events().filter((e) => e['type'] === 'call' && e['status'] === 'ended').length,
+    0,
+    'the new call was ended by a stale hangup',
+  );
+});

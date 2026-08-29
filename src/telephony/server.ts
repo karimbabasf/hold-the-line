@@ -435,7 +435,13 @@ const handle = createRouter({
       live.callStarted(undefined, ev.caller);
     } else if (ev.kind === 'ended') {
       disarmIdleEnd();
-      live.callEnded();
+      // Only for a call that is actually on screen. An end with no call
+      // showing is held as a pending end and applied to whatever starts
+      // next, which was safe while the only source was a turn aborting
+      // mid-session and is not safe now: a leg that never connected, or a
+      // hangup for a call this process was restarted out of, would end the
+      // next caller's call the moment it opened.
+      if (live.onCall()) live.callEnded();
     }
     return { status: 200, body: { ok: true } };
   },
