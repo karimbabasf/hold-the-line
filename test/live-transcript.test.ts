@@ -140,6 +140,53 @@ test('a call that never started cannot end', () => {
   assert.equal(seen.events().length, 0);
 });
 
+test('a hangup before the call was reported is applied once it exists', () => {
+  // The abort can land while the bridge is still awaiting a session, so the
+  // end is announced before the start. Found by Qodo.
+  const live = createLiveConsole();
+  const seen = recorder();
+  live.attach(seen.sink);
+
+  live.callEnded('+1');
+  live.broadcast({ type: 'call', t: 0, status: 'started', caller: '+1' });
+
+  assert.deepEqual(
+    seen.events().map((e) => `${e.type}:${'status' in e ? e.status : ''}`),
+    ['call:started', 'call:ended'],
+  );
+  assert.equal(live.onCall(), false);
+});
+
+test('a caller who rings back reopens the call the bridge resumes', () => {
+  // A live harness session means the bridge reports a resume, not a start, so
+  // without this the console stays in "call over" for the whole new call.
+  // Found by Qodo.
+  const live = createLiveConsole();
+  live.broadcast({ type: 'call', t: 0, status: 'started', caller: '+1' });
+  live.callEnded('+1');
+  assert.equal(live.onCall(), false);
+
+  live.broadcast({ type: 'session', t: 0, status: 'resumed', session_id: 'sess-1' });
+  assert.equal(live.onCall(), true);
+});
+
+test('words held from a caller who is not the one on screen are dropped', () => {
+  // Before a call starts every caller is accepted, so the pending buffer has
+  // to remember whose words it is holding. Found by Qodo.
+  const live = createLiveConsole();
+  const seen = recorder();
+  live.attach(seen.sink);
+
+  live.callerSaid('this one got through', '+1');
+  live.callerSaid('this one did not', '+2');
+  live.broadcast({ type: 'call', t: 0, status: 'started', caller: '+1' });
+
+  assert.deepEqual(
+    seen.events().filter((e) => e.type === 'transcript').map((e) => e.text),
+    ['this one got through'],
+  );
+});
+
 test('a new call reopens the header after the last one ended', () => {
   const live = createLiveConsole();
   live.broadcast({ type: 'call', t: 0, status: 'started', caller: '+1' });

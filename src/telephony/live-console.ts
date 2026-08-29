@@ -154,7 +154,16 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
    * `call started` empties the replay buffer, so anything broadcast ahead of
    * it is gone from a console that connects a second later.
    */
-  const pendingCallerText: string[] = [];
+  const pendingCallerText: Array<{ caller: string | undefined; text: string }> = [];
+  /**
+   * A hangup that arrived before the call was reported.
+   *
+   * The abort can land while the bridge is still awaiting a session, so the
+   * end is announced before the start. Dropping it there left a disconnected
+   * caller on screen as an active call for good; held here, it is applied the
+   * moment the call it belongs to exists. Found by Qodo.
+   */
+  let pendingEnd: { caller: string | undefined } | null = null;
   let warnedUnconfigured = false;
 
   /** True when this turn belongs to the call the console is showing. */
@@ -203,19 +212,32 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
       // not end twice. Dropping the repeat here rather than at each caller
       // keeps every path that notices a hangup honest without any of them
       // having to know about the others.
-      if (callStart === null || callOver) return;
+      if (callOver) return;
+      if (callStart === null) {
+        // The start is still in flight. Held rather than dropped: the caller
+        // really has gone. Found by Qodo.
+        pendingEnd = { caller: event.caller };
+        return;
+      }
       callOver = true;
       // Nobody is on hold on a dead line. This is the last chance to stop
       // that clock, and it goes out BEFORE the call frame so an operator
       // reads it in the order it happened.
       holdStopped();
-    } else if (callStart === null && event.type === 'session' && event.status === 'resumed') {
+    } else if ((callStart === null || callOver) && event.type === 'session' && event.status === 'resumed') {
       // A call that came back after this process restarted never reports a
       // `call started`: the bridge finds a checkpoint and reports a resume.
       // Without anchoring here, every event on that call is stamped t: 0 and
       // the console re-anchors its clocks to zero over and over. Found by
       // Qodo.
+      //
+      // The same anchor reopens a call after a hangup. A caller who rings back
+      // inside the process still has a live harness session, so the bridge
+      // reports a resume rather than a start, and without this the console
+      // stays in "call over" for the whole of the new call. Found by Qodo.
       callStart = at ?? now();
+      callOver = false;
+      onHold = false;
     }
     const stamped = {
       ...event,
@@ -241,13 +263,22 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     // caller waiting on an answer. Spliced before the loop, so the nested
     // broadcast each one runs finds nothing left to flush.
     if (callStart !== null && pendingCallerText.length > 0) {
-      for (const said of pendingCallerText.splice(0)) {
-        emit({ type: 'transcript', who: 'caller', text: said, final: true });
+      // Only this call's words. A request that arrived before the call was
+      // reported, from a caller who is not the one now on screen, is dropped
+      // rather than read out under somebody else's name. Found by Qodo.
+      for (const held of pendingCallerText.splice(0)) {
+        if (!ownsCall(held.caller)) continue;
+        emit({ type: 'transcript', who: 'caller', text: held.text, final: true });
       }
     }
     if (pendingHold && callStart !== null) {
       pendingHold = false;
       holdStarted();
+    }
+    if (pendingEnd !== null && callStart !== null) {
+      const ended = pendingEnd;
+      pendingEnd = null;
+      callEnded(ended.caller);
     }
   }
 
@@ -354,7 +385,7 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     const said = text.trim();
     if (said === '') return;
     if (callStart === null) {
-      pendingCallerText.push(said);
+      pendingCallerText.push({ caller: callerId, text: said });
       return;
     }
     emit({ type: 'transcript', who: 'caller', text: said, final: true });

@@ -178,6 +178,13 @@ const chat = createChatEndpoint({
   onCallerGone: (callerId) => {
     console.log(`[call] ${callerId} is gone`);
     live.callEnded(callerId);
+    // The physical call is over, so the fast-path session is not live any
+    // more. The disk checkpoint still carries the conversation, so the same
+    // number ringing back inside the resume window continues where it left
+    // off; what changes is that the bridge now reports that resume, which is
+    // what reopens the call on screen. Without this the console stayed in
+    // "call over" for the whole of the next call. Found by Qodo.
+    bridge.sessions.delete(callerId);
   },
 });
 
