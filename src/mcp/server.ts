@@ -37,7 +37,7 @@ import {
   loadStateRules,
   loadVehicle,
 } from '../data/fixtures.ts';
-import { daysBetween } from '../settle/settle.ts';
+import { daysBetween, settle } from '../settle/settle.ts';
 import { LANES, type LaneDef } from './lanes.ts';
 import {
   approveGate,
@@ -75,9 +75,29 @@ export function policyLookup(args: { phone: string }) {
   return policy;
 }
 
+/**
+ * Matches a claim id the way a person says it out loud.
+ *
+ * A caller says "claim 40218". The record says "CLM-40218". Demanding the
+ * exact stored string means the very first lookup on a real call fails, which
+ * is how this was found: by ringing the thing rather than reading it.
+ *
+ * This is deliberately NOT applied to loan ids. A partial claim id still
+ * identifies the same claim, but a loosely matched loan id would identify a
+ * DIFFERENT loan and produce a payoff figure the agent then says out loud.
+ * Ambiguity is fine for finding a record and unacceptable for money.
+ */
+export function claimIdMatches(spoken: string, stored: string): boolean {
+  const digits = (v: string) => v.replace(/[^0-9]/g, '');
+  const a = digits(spoken);
+  const b = digits(stored);
+  // An empty or too-short input must never match by accident.
+  return a.length >= 4 && a === b;
+}
+
 export function claimGet(args: { claim_id: string }) {
   const claim = loadClaim();
-  if (args.claim_id !== claim.claim_id) {
+  if (!claimIdMatches(args.claim_id, claim.claim_id)) {
     throw new Error(`claim.get: no claim on file with id "${args.claim_id}".`);
   }
   return claim;
@@ -155,9 +175,85 @@ export function stateRulesGet(args: { state: string }) {
   return rules;
 }
 
+/**
+ * Runs the verified settlement engine.
+ *
+ * This exists because the agent was writing its own arithmetic in the sandbox
+ * and arriving at a different number: 7,881.55 against a correct 13,481.12,
+ * on a live run. A settlement figure spoken to a claimant cannot come from
+ * whatever code a model improvises that turn, and the on-screen breakdown has
+ * to add up to what was said. So the maths lives in one tested place and the
+ * agent calls it.
+ *
+ * The sandbox still does real work: the agent runs code to explain a figure a
+ * caller challenges, which is a different job from deciding what to pay.
+ */
+/**
+ * One call that gathers the whole claim, fanning out server side.
+ *
+ * Two problems made this necessary, both found by driving a real call.
+ *
+ * The records form a dependency chain: the VIN comes from the claim, and the
+ * loan id comes from the vehicle. So an agent told to "fetch everything at
+ * once" cannot, and instead fires five calls with whatever identifier it has,
+ * inventing a `claim_number` parameter that no tool declares. Five validation
+ * errors, and the call stalls waiting for tool responses that never come.
+ *
+ * Doing the fan-out here fixes both. The agent makes one call it cannot get
+ * wrong, and the concurrency is real rather than aspirational: the lanes that
+ * can run together do, and the timings come back for the console.
+ */
+export async function claimSnapshot(args: { claim_id: string }) {
+  const started = Date.now();
+  const timings: Array<{ lane: string; elapsed_ms: number }> = [];
+
+  async function lane<T>(name: string, fn: () => T): Promise<T> {
+    const t0 = Date.now();
+    const out = await Promise.resolve(fn());
+    timings.push({ lane: name, elapsed_ms: Date.now() - t0 });
+    return out;
+  }
+
+  // First hop: everything reachable from the claim id alone.
+  const [claim, rules, storage] = await Promise.all([
+    lane('claim', () => claimGet(args)),
+    lane('state rules', () => stateRulesGet({ state: loadPolicy().state })),
+    lane('yard storage', () => yardStorageStatus(args)),
+  ]);
+
+  // Second hop: needs the VIN, which only the claim carries.
+  const [vehicle, comps] = await Promise.all([
+    lane('vehicle', () => vehicleGet({ vin: claim.vin })),
+    lane('valuation comps', () => valuationComps({ vin: claim.vin })),
+  ]);
+
+  // Third hop: needs the loan id, which only the vehicle carries.
+  const payoff = await lane('lienholder payoff', () =>
+    lienholderPayoffQuote({ loan_id: vehicle.lien.loan_id, through_date: vehicle.lien.good_through }),
+  );
+
+  const serial_ms = timings.reduce((a, t) => a + t.elapsed_ms, 0);
+  return {
+    claim, vehicle, comps, payoff, storage, state_rules: rules,
+    policy: policyLookup({ phone: loadPolicy().phone }),
+    lanes: timings,
+    parallel_ms: Date.now() - started,
+    serial_ms,
+  };
+}
+
+export function settlementCalculate(args: { retain_salvage: boolean }) {
+  const vehicle = loadVehicle();
+  return settle({
+    retain_salvage: args.retain_salvage,
+    // Always the lender's own validity date. Anything later invents interest.
+    through_date: vehicle.lien.good_through,
+  });
+}
+
 export function yardStorageStatus(args: { claim_id: string }) {
   const claim = loadClaim();
-  if (args.claim_id !== claim.claim_id) {
+  if (!claimIdMatches(args.claim_id, claim.claim_id)) {
     throw new Error(`yard.storage_status: no claim on file with id "${args.claim_id}".`);
   }
   const days = daysBetween(claim.storage_start, claim.quote_date);
@@ -197,7 +293,7 @@ const SAFE_TOOLS: readonly ToolEntry[] = [
   },
   {
     name: 'claim.get',
-    description: 'Fetch a claim by id.',
+    description: 'Fetch a claim by id. Accepts the number as a caller says it, with or without the CLM- prefix.',
     input: { claim_id: z.string() },
     annotations: { readOnlyHint: true },
     handler: (a) => claimGet(a as { claim_id: string }),
@@ -247,6 +343,33 @@ const SAFE_TOOLS: readonly ToolEntry[] = [
     input: { claim_id: z.string() },
     annotations: { readOnlyHint: true },
     handler: (a) => yardStorageStatus(a as { claim_id: string }),
+  },
+  {
+    name: 'claim.snapshot',
+    description:
+      'Everything on one claim in a single call: the claim, the vehicle, the valuation ' +
+      'comparables, the lienholder payoff, the yard storage and the state rules, gathered ' +
+      'concurrently. Start here. Do not call the individual lookups one by one, and do not try ' +
+      'to fetch the vehicle or the payoff before you have this, because the VIN and the loan id ' +
+      'only exist inside it.',
+    input: { claim_id: z.string().describe('the claim number as the caller says it') },
+    annotations: { readOnlyHint: true },
+    handler: (a) => claimSnapshot(a as { claim_id: string }),
+  },
+  {
+    name: 'settlement.calculate',
+    description:
+      'Run the settlement calculation. Returns the total loss test, the actual cash value, the ' +
+      'lien payoff and the net, with a line-by-line breakdown where every line is tagged as ' +
+      'computed or read from a record. Use this rather than working the figures out yourself: ' +
+      'the breakdown shown to the adjuster has to add up to the number you say out loud.',
+    input: {
+      retain_salvage: z
+        .boolean()
+        .describe('true if the owner keeps the wreck, which deducts the salvage bid'),
+    },
+    annotations: { readOnlyHint: true },
+    handler: (a) => settlementCalculate(a as { retain_salvage: boolean }),
   },
 ];
 

@@ -57,13 +57,14 @@ test('GET /health responds ok', async () => {
   assert.deepEqual(await res.json(), { ok: true });
 });
 
-test('lists all eight safe tools and five gated tools', async () => {
+test('lists all ten safe tools and five gated tools', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
 
   assert.deepEqual(names, [
     'claim.get',
+    'claim.snapshot',
     'claims_history.get',
     'coverage.deny',
     'lienholder.payoff_quote',
@@ -72,6 +73,7 @@ test('lists all eight safe tools and five gated tools', async () => {
     'policy.lookup',
     'salvage.release_vehicle',
     'settlement.accept',
+    'settlement.calculate',
     'state_rules.get',
     'valuation.comps',
     'vehicle.get',
@@ -334,4 +336,46 @@ test('an oversized body gets a clean 413, not a connection reset', async () => {
   });
   assert.equal(res.status, 413);
   assert.equal(res.headers.get('connection'), 'close');
+});
+
+test('a claim id is matched the way a caller says it', async () => {
+  const { claimIdMatches, claimGet } = await import('../src/mcp/server.ts');
+
+  // Found by ringing the thing rather than reading it: the caller says
+  // "claim 40218", the record says "CLM-40218", and the very first lookup on
+  // a real call failed.
+  assert.equal(claimIdMatches('40218', 'CLM-40218'), true);
+  assert.equal(claimIdMatches('CLM-40218', 'CLM-40218'), true);
+  assert.equal(claimIdMatches('claim 40218', 'CLM-40218'), true);
+  assert.equal(claimIdMatches('clm 40218', 'CLM-40218'), true);
+
+  assert.equal(claimGet({ claim_id: '40218' }).claim_id, 'CLM-40218');
+  assert.equal(claimGet({ claim_id: 'claim 40218' }).claim_id, 'CLM-40218');
+});
+
+test('a loose claim id still cannot match the wrong claim', async () => {
+  const { claimIdMatches } = await import('../src/mcp/server.ts');
+
+  assert.equal(claimIdMatches('40219', 'CLM-40218'), false);
+  assert.equal(claimIdMatches('4021', 'CLM-40218'), false);
+  // Nothing at all must never match by accident.
+  assert.equal(claimIdMatches('', 'CLM-40218'), false);
+  assert.equal(claimIdMatches('CLM-', 'CLM-40218'), false);
+  assert.equal(claimIdMatches('claim', 'CLM-40218'), false);
+});
+
+test('a loan id stays strict, because a near miss is a different loan', async () => {
+  const { lienholderPayoffQuote } = await import('../src/mcp/server.ts');
+
+  // The relaxation above is deliberately not applied here. A partial claim id
+  // still identifies the same claim; a loosely matched loan id identifies a
+  // different loan and produces a payoff the agent says out loud.
+  assert.throws(
+    () => lienholderPayoffQuote({ loan_id: '9920431', through_date: '2026-10-02' }),
+    /unknown loan_id/,
+  );
+  assert.equal(
+    lienholderPayoffQuote({ loan_id: 'CAF-9920431', through_date: '2026-10-02' }).payoff,
+    8764.12,
+  );
 });
