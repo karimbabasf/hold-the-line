@@ -74,6 +74,13 @@ console.log(`     ${n} tools registered`);
 if (!n) { console.error("     NO TOOLS. the agent will answer with nothing."); process.exit(1); }
 '
 
+# The agent itself. Editing agent.json used to change nothing, because the only
+# thing that ever created the agent was a one-off POST in the README and a
+# repeat of that returns 409. Publishing on every start is what makes an edit to
+# the instructions reach a running assistant.
+echo "     publishing agent.json"
+node scripts/publish-agent.mjs
+
 cat <<EOF
 
 up.
