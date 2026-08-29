@@ -139,7 +139,8 @@ export class TrueForgeClient {
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const res = await this.request(method, path, body);
+    // Non-streaming, so the deadline covers reading the body too.
+    const res = await this.request(method, path, body, undefined, { streaming: false });
     return (await res.json()) as T;
   }
 
@@ -148,16 +149,22 @@ export class TrueForgeClient {
     path: string,
     body?: unknown,
     signal?: AbortSignal,
+    opts: { streaming?: boolean } = {},
   ): Promise<Response> {
-    // The timeout covers CONNECTING only, and is cleared the moment headers
-    // arrive.
+    const streaming = opts.streaming ?? true;
+    // How long the timeout lives depends on whether a body is finite.
     //
-    // AbortSignal.timeout() stays live for the whole response lifetime,
-    // including the body. On an SSE turn that means the harness gets 30
-    // seconds total and then the stream dies mid-call, which is precisely the
-    // failure this project cannot have: a caller on hold while the agent is
-    // thinking. The caller's own signal stays attached, because a caller who
-    // hangs up should still cancel the turn.
+    // AbortSignal.timeout() stays live for the whole response lifetime. On an
+    // SSE turn that kills the stream mid-call, which is the failure this
+    // project cannot have: a caller on hold while the agent is thinking. So
+    // for a stream the timer is cleared once headers arrive and the caller's
+    // own signal governs the body.
+    //
+    // Clearing it for EVERY request went too far the other way, and Qodo
+    // caught it: a finite JSON or error read then had no deadline at all, so
+    // a server that sends headers and stalls its body hangs createSession
+    // forever. Non-streaming requests keep the timer until the body is
+    // consumed.
     const connectTimeout = new AbortController();
     const timer = setTimeout(() => {
       connectTimeout.abort(new Error(`no response within ${this.timeoutMs}ms`));
@@ -175,17 +182,36 @@ export class TrueForgeClient {
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: combined,
       });
-    } finally {
+    } catch (error) {
       clearTimeout(timer);
+      throw error;
     }
 
     if (!res.ok) {
+      // An error body is finite, so it stays under the deadline regardless of
+      // whether the request was going to stream.
       const text = await res.text().catch(() => '');
+      clearTimeout(timer);
       throw new TrueForgeError(
         `${method} ${path} failed with ${res.status}`,
         res.status,
         text,
       );
+    }
+
+    if (streaming) {
+      // Headers are in and the body is a long-lived stream. Hand it over.
+      clearTimeout(timer);
+    } else {
+      // Leave the timer running so a stalled body still aborts. It is cleared
+      // when the response settles either way.
+      void res
+        .clone()
+        .arrayBuffer()
+        .then(
+          () => clearTimeout(timer),
+          () => clearTimeout(timer),
+        );
     }
     return res;
   }
