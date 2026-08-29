@@ -17,7 +17,7 @@
  * the whole event, `type` included, so a client never has to reassemble a
  * payload from the event name alone.
  *
- * Seven event types, deliberately kept to seven rather than one per status
+ * Eight event types, deliberately kept small rather than one per status
  * transition, so this contract stays small enough for another agent to
  * implement the real emitter against without re-deriving the shape:
  *
@@ -200,6 +200,9 @@ export interface CallEvent {
 /**
  * One line of what was actually said on the call.
  *
+ * This is the only event a person watching the call reads directly, so it
+ * carries no ids and no provenance: just who spoke and what they said.
+ *
  * `who: 'caller'` is the user message off `POST /v1/chat/completions`, which
  * arrives whole, so it is always `final: true`.
  *
@@ -212,12 +215,18 @@ export interface CallEvent {
  *
  * `text` on an agent partial is CUMULATIVE, not the delta on its own: every
  * `final: false` event carries the whole of what the agent has said this turn
- * so far, and the single `final: true` at the end of the turn carries the
- * settled line. A client renders one line per turn and replaces it on each
- * event rather than appending. Cumulative because a frame lost to a reconnect
- * or to the ring buffer would otherwise take its words out of the transcript
- * silently, and a transcript that quietly drops words is the same class of
- * failure the provenance counters exist to catch.
+ * so far, and REPLACES the previous non-final line from the same speaker, so
+ * a sentence fills in where it started instead of stacking up half-written
+ * copies of itself. The single `final: true` at the end carries the settled
+ * line. A speaker has at most one non-final line outstanding. Cumulative
+ * because a frame lost to a reconnect or to the ring buffer would otherwise
+ * take its words out of the transcript silently, and a transcript that
+ * quietly drops words is the same class of failure the provenance counters
+ * exist to catch.
+ *
+ * There is no `status` field, unlike the other lifecycle events, because a
+ * transcript line has no lifecycle: `final` already carries the only two
+ * states it can be in, and a second discriminant would let the two disagree.
  */
 export interface TranscriptEvent {
   type: 'transcript';
@@ -463,7 +472,10 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
 
   const events: ConsoleEvent[] = [
     { type: 'call', t: 0, status: 'started', claim_id: 'CLM-40218', caller: 'Daniel Ortiz' },
+    { type: 'transcript', t: 1200, who: 'caller', text: 'Claim 40218, the Outback.', final: false },
+    { type: 'transcript', t: 3200, who: 'caller', text: "Claim 40218, the Outback. Shop says it's totaled and the yard is charging me by the day. What am I getting?", final: true },
     { type: 'hold', t: 5_000, status: 'started' },
+    { type: 'transcript', t: 5400, who: 'agent', text: 'I have the claim, and I have an adjuster on this call with me. Give me a moment, I am pulling everything at once.', final: true },
 
     // FAN-OUT. Five lanes fire at once; the staggered delayMs below is the
     // recorded latency of the actual lanes, not simulated slowness, so the
@@ -496,27 +508,35 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
     },
     { type: 'lanes_summary', t: 11_450, parallel_ms: 3_400, serial_ms: 11_100 },
 
+    { type: 'transcript', t: 13600, who: 'agent', text: 'While that finishes, your rental has four days left and the yard is at 75 a day.', final: true },
     // 0:14, dead air filled with the first two lanes that landed.
     { type: 'number', t: 14_000, label: 'Rental days remaining', value: 4, from: 'computed', run_id: RUN_RENTAL, unit: 'days', spoken: true },
     { type: 'number', t: 14_400, label: 'Yard storage rate', value: 75.0, from: 'record', source: 'claim.storage_per_day', unit: 'usd', spoken: true },
 
+    { type: 'transcript', t: 31000, who: 'agent', text: 'Your car was worth 21,340 dollars.', final: false },
     // 0:20-0:32, SANDBOX CALL 1: settle({ retain_salvage: false }).
     { type: 'number', t: 32_000, label: 'Actual cash value', value: 21_340.0, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
     { type: 'number', t: 32_300, label: 'Repair estimate', value: 16_780.0, from: 'record', source: 'claim.repair_estimate', unit: 'usd', spoken: true },
     { type: 'number', t: 32_600, label: 'Loss ratio', value: 78.6, from: 'computed', run_id: RUN_CASH, unit: 'percent', spoken: true },
     { type: 'number', t: 32_900, label: 'Total loss threshold', value: 75, from: 'record', source: 'state_rules.total_loss_threshold_pct', unit: 'percent', spoken: true },
 
+    { type: 'transcript', t: 33000, who: 'agent', text: 'Your car was worth 21,340 dollars. Repairs came to 16,780, which is 78.6 percent of that, and our threshold in this state is 75. So yes, it is a total loss.', final: true },
+    { type: 'transcript', t: 37600, who: 'agent', text: 'After tax and fees, less your thousand-dollar deductible, less the payoff to Cascade, you are at 13,481 dollars and 12 cents.', final: true },
     // 0:38, walking the net figure.
     { type: 'number', t: 38_000, label: 'Sales tax', value: 1_835.24, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
     { type: 'number', t: 38_300, label: 'Collision deductible', value: 1_000.0, from: 'record', source: 'policy.deductible_collision', unit: 'usd', spoken: true },
     { type: 'number', t: 38_600, label: 'Net settlement, cash', value: 13_481.12, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
 
+    { type: 'transcript', t: 43000, who: 'caller', text: "Hold on. My statement said 8,700. Where's 8,764 coming from?", final: true },
+    { type: 'transcript', t: 44600, who: 'agent', text: 'Your loan accrues 1 dollar 84 cents a day.', final: false },
     // 0:45, THE PROOF BEAT. The caller's statement shows the principal
     // without the interest since; only the run can produce 8,764.12.
     { type: 'number', t: 45_000, label: 'Lien per diem', value: 1.84, from: 'record', source: 'vehicle.lien.per_diem', unit: 'usd', spoken: true },
     { type: 'number', t: 45_300, label: 'Days of accrued interest', value: 35, from: 'computed', run_id: RUN_CASH, unit: 'days', spoken: true },
     { type: 'number', t: 45_600, label: 'Lienholder payoff', value: 8_764.12, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
 
+    { type: 'transcript', t: 46000, who: 'agent', text: 'Your loan accrues 1 dollar 84 cents a day. I quoted the payoff through October 2, which is 35 days of interest.', final: true },
+    { type: 'transcript', t: 56000, who: 'caller', text: 'Okay, so what do I...', final: true },
     // 0:57, THE DROP. The hold clock stops: nobody is on hold on a dead line.
     { type: 'session', t: 57_000, status: 'suspended', session_id: SESSION_ID },
     { type: 'hold', t: 57_000, status: 'stopped' },
@@ -525,6 +545,7 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
     { type: 'session', t: 63_000, status: 'resumed', session_id: SESSION_ID, run_ids: [RUN_CASH] },
     { type: 'hold', t: 63_000, status: 'started' },
 
+    { type: 'transcript', t: 64000, who: 'agent', text: 'Welcome back. You were asking about the payoff. Nothing was recomputed, your net is still 13,481 dollars and 12 cents.', final: true },
     // 1:10, THE GATE. First draft, cash only, the word "final" still in it.
     // While this is open, TrueForge answers any further caller utterance
     // with 422: the line is genuinely halted, not merely waiting.
@@ -565,6 +586,8 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
         'If you would rather keep the car, we can settle at 9,180 dollars and 12 cents with a salvage title, subject to your lender releasing it.',
     },
 
+    { type: 'transcript', t: 102500, who: 'agent', text: 'Northvane can settle at 13,481 dollars and 12 cents. That offer stands for 30 days and you may use your own appraiser. If you would rather keep the car, we can settle at 9,180 dollars and 12 cents with a salvage title, subject to your lender releasing it.', final: true },
+    { type: 'transcript', t: 110000, who: 'caller', text: "Let's take the cash. 13,481 works.", final: true },
     // 1:52, the caller takes the cash. 13,481.12 is inside gate-2's
     // authorised amounts, so `settlement.accept` is pre-authorised: no
     // second operator click, and the console says why.
@@ -574,6 +597,7 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
       reason: '13,481.12 matches an amount gate-2 already authorised. no operator gate required.',
     },
 
+    { type: 'transcript', t: 113500, who: 'agent', text: 'Recorded. Payment goes out today. Storage has run six days, 450 dollars, and I have released the vehicle so it stops tonight.', final: true },
     // 2:15, end of call. Counters hold on screen.
     { type: 'hold', t: 135_000, status: 'stopped' },
     { type: 'call', t: 135_000, status: 'ended', claim_id: 'CLM-40218' },

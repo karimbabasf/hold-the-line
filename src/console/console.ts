@@ -8,16 +8,16 @@
  * pull in just enough ambient browser typing for this one file to
  * typecheck under `npx tsc -p tsconfig.json --noEmit`.
  *
- * By default this connects live to `/events`, so the operator sees real
- * call data the moment they open the page. Query parameters switch to the
+ * By default this connects live to `/sse`, so the operator sees real call
+ * data the moment they open the page. Query parameters switch to the
  * recorded demo or change playback for development:
  *
  *   ?demo             replay `recordedNorthvaneCall()` in real time.
  *   ?speed=20         replay faster than real time (debugging, not demo).
  *   ?until=71000      dispatch every event with t <= 71000 instantly, then
- *                      freeze there. Used to capture docs/console.png with
- *                      the gate open and the hold clock already running.
- *   ?live=<url>       connect to a custom emitter URL instead of /events.
+ *                      freeze there. Used to capture screenshots with the
+ *                      gate open.
+ *   ?live=<url>       connect to a custom emitter URL instead of /sse.
  *
  * Live, the gate buttons post to `/gate/decide` on the telephony process,
  * which is what actually releases a held caller. In replay they resolve the
@@ -25,6 +25,15 @@
  *
  * None of these change the event contract in `events.ts`; they only
  * change how this file schedules dispatch.
+ *
+ * WHO THIS SCREEN IS FOR
+ *
+ * A person watching a claim call, not a person debugging one. Everything
+ * on the primary view is in the words that person already uses: "Reading
+ * the policy", not `policy.lookup`; "Read from the claim file", not
+ * `record - state_rules.json:mileage_adjustment_per_mile`. The provenance
+ * is still all there, one disclosure away, because the proof is the point
+ * of the project. It is just not the loudest thing on the screen any more.
  */
 
 /// <reference lib="dom" />
@@ -42,13 +51,12 @@ import {
   type LanesSummaryEvent,
   type NumberEvent,
   type SessionEvent,
+  type TranscriptEvent,
 } from './events.ts';
 import { createGateClient, type GateResult } from './gate-client.ts';
 import type { SettleLine } from '../settle/settle.ts';
 import {
-  formatNumberLine,
   formatUsd,
-  formatUtteranceLine,
   numbersFromEvents,
   tally,
   tallyUtterances,
@@ -92,16 +100,83 @@ function formatClock(ms: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+/**
+ * How long something took, in a unit that is true at this size.
+ *
+ * The lanes used to render as `(ms / 1000).toFixed(1)` unconditionally,
+ * which prints "0.0s" for everything a local fixture does, because a local
+ * fixture answers in single-digit milliseconds. Working software that
+ * reports 0.0s reads as broken software. Sub-second work is reported in
+ * milliseconds, and the whole point of the fan-out counter, that five
+ * things happened at once, survives either way.
+ */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '-';
+  if (ms === 0) return '0 ms';
+  // The live harness reports fractional milliseconds (0.688, 8.837). One
+  // decimal under 10 ms keeps those distinguishable instead of rounding a
+  // whole fan-out to the same "1 ms".
+  if (ms < 10) return `${ms.toFixed(1)} ms`;
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
 function formatNumberValue(ev: NumberEvent): string {
   if (ev.unit === 'percent') return `${ev.value}%`;
   if (ev.unit === 'days') return `${ev.value} ${ev.value === 1 ? 'day' : 'days'}`;
   return formatUsd(ev.value);
 }
 
-function tagText(ev: NumberEvent): string {
-  if (ev.from === 'computed') return `computed · ${ev.run_id ?? 'no run id'}`;
-  if (ev.from === 'record') return `record · ${ev.source ?? 'no source'}`;
-  return 'RECALLED, NO SOURCE';
+/** A provenance tag, said the way a person would say it. The strings behind
+ *  it (`run_id`, `source`) stay available in the disclosure below the
+ *  statement; they are not what a viewer should be reading first. */
+function provenanceWords(from: 'computed' | 'record' | undefined): string {
+  if (from === 'computed') return 'Worked out on this call';
+  if (from === 'record') return 'Read from the claim file';
+  return 'No source. Do not say this figure.';
+}
+
+// ---------------------------------------------------------------------------
+// The one place that decides what the screen is showing.
+//
+// The old header could say ON CALL while the panel beside it said "Waiting
+// for the call to start", because two different handlers each owned a piece
+// of the answer. There is one answer now and one function that applies it,
+// so the two cannot disagree.
+
+type Screen = 'idle' | 'live' | 'gate' | 'ended';
+
+let callLive = false;
+let callEverStarted = false;
+let gateIsOpen = false;
+
+function currentScreen(): Screen {
+  if (!callEverStarted) return 'idle';
+  if (!callLive) return 'ended';
+  return gateIsOpen ? 'gate' : 'live';
+}
+
+function applyScreen(): void {
+  const screen = currentScreen();
+  document.body.dataset['state'] = screen;
+
+  const chip = el('status-chip');
+  const chipText: Record<Screen, string> = {
+    idle: 'Line ready',
+    live: 'On air',
+    gate: 'Line halted',
+    ended: 'Call ended',
+  };
+  chip.textContent = chipText[screen];
+
+  // A clock never runs against a line nobody is on. `call-stat` appears with
+  // the call and freezes with it; `hold-stat` appears only while a caller is
+  // genuinely holding, which is what stopped the old "CALLER ON HOLD 0:02"
+  // counting up over an empty screen.
+  el('call-stat').hidden = screen === 'idle';
+  el('hold-stat').hidden = !(holdRunning && callLive);
+
+  el('doing-now').textContent = describeActivity();
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +213,7 @@ function onHold(ev: HoldEvent): void {
     if (holdRunning) holdAccumulatedMs += ev.t - holdStartedAtCallTime;
     holdRunning = false;
   }
+  applyScreen();
 }
 
 function currentHoldMs(): number {
@@ -152,54 +228,280 @@ function currentHoldMs(): number {
 let callEndedAtCallTime: number | null = null;
 
 function tickClocks(): void {
+  // No call, no clocks. Nothing to count and nothing on screen to count it.
+  if (!callEverStarted) return;
   el('call-clock').textContent = formatClock(callEndedAtCallTime ?? virtualNow());
-  el('hold-clock').textContent = formatClock(currentHoldMs());
+  if (holdRunning && callLive) el('hold-clock').textContent = formatClock(currentHoldMs());
   tickGateHold();
 }
 
 // ---------------------------------------------------------------------------
-// Lanes pane.
+// What the agent is doing, in the words a person watching would use.
+//
+// The lanes are the raw material. A lane is an MCP tool call with a tool
+// name on it; nobody watching a claim call needs to read `policy.lookup` to
+// understand that the agent is reading the policy.
 
-const laneRows = new Map<string, HTMLLIElement>();
+const LANE_WORDS: Record<string, string> = {
+  'policy.lookup': 'Reading the policy',
+  'valuation.comps': 'Pricing the car against recent sales',
+  'lienholder.payoff_quote': 'Getting the loan payoff',
+  'claims_history.get': 'Checking past claims on this car',
+  'state_rules.get': "Checking the state's rules",
+};
+
+function laneWords(ev: LaneEvent): string {
+  const known = LANE_WORDS[ev.tool];
+  if (known) return known;
+  // Unknown tool: fall back to the lane's own human label rather than to the
+  // tool name, which is the one string this screen must never show.
+  return ev.name.charAt(0).toUpperCase() + ev.name.slice(1);
+}
+
+interface LaneState {
+  ev: LaneEvent;
+  row: HTMLLIElement;
+}
+
+const lanes = new Map<string, LaneState>();
+let settlementKnown = false;
+/** Set by the events that describe themselves better than the lane state
+ *  can (a redraft, a dropped line), cleared by the next thing that happens. */
+let activityOverride: string | null = null;
+
+function describeActivity(): string {
+  if (!callEverStarted) return '';
+  if (!callLive) return 'The call is finished.';
+  if (gateIsOpen) return 'Waiting for your approval';
+  if (activityOverride) return activityOverride;
+  const pending = [...lanes.values()].some((l) => l.ev.status === 'pending');
+  if (pending) return 'Looking up the claim record';
+  if (!settlementKnown) return 'Working out the settlement';
+  return 'Talking the caller through the numbers';
+}
 
 function onLane(ev: LaneEvent): void {
-  let row = laneRows.get(ev.tool);
-  if (!row) {
-    row = h('li', { class: 'lane-row' });
-    el('lanes-list').appendChild(row);
-    laneRows.set(ev.tool, row);
+  activityOverride = null;
+  let state = lanes.get(ev.tool);
+  if (!state) {
+    const row = h('li', { class: 'step' });
+    el('steps').appendChild(row);
+    state = { ev, row };
+    lanes.set(ev.tool, state);
   }
-  row.className = `lane-row lane-row--${ev.status}`;
-  row.replaceChildren(
-    h('span', { class: 'lane-dot' }),
-    h('span', { class: 'lane-name' }, [ev.name]),
-    h('span', { class: 'lane-elapsed mono' }, [
-      ev.status === 'done' ? `${((ev.elapsed_ms ?? 0) / 1000).toFixed(1)}s` : 'running',
+  state.ev = ev;
+  state.row.className = `step step--${ev.status}`;
+  state.row.replaceChildren(
+    h('span', { class: 'step-mark' }, [ev.status === 'done' ? '✓' : '●']),
+    h('span', {}, [
+      laneWords(ev),
+      h('span', { class: 'step-took mono' }, [
+        ev.status === 'done' ? formatDuration(ev.elapsed_ms ?? 0) : 'running',
+      ]),
     ]),
-    h('span', { class: 'lane-summary' }, [ev.summary ?? ev.tool]),
   );
+  applyScreen();
 }
 
 function onLanesSummary(ev: LanesSummaryEvent): void {
-  const p = (ev.parallel_ms / 1000).toFixed(1);
-  const s = (ev.serial_ms / 1000).toFixed(1);
-  el('lanes-counter').textContent = `${p}s parallel versus ${s}s serial`;
+  const count = lanes.size || 5;
+  const box = el('together');
+  box.hidden = false;
+  box.replaceChildren(
+    `All ${count} checks ran at the same time. `,
+    h('b', {}, [formatDuration(ev.parallel_ms)]),
+    ' instead of ',
+    h('b', {}, [formatDuration(ev.serial_ms)]),
+    ' one after another.',
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Computed pane. Every number the agent holds. Nothing untagged: a missing
-// `from` renders red rather than silently blending in.
+// The transcript. The centrepiece: it is how a viewer follows the call.
+//
+// A `final: false` line replaces the previous unfinished line from the same
+// speaker, so a sentence fills in where it started rather than stacking up
+// half-written copies of itself.
 
-function onNumber(ev: NumberEvent): void {
-  const tagClass = ev.from === 'computed' ? 'tag--computed' : ev.from === 'record' ? 'tag--record' : 'tag--recalled';
-  const tile = h('li', { class: `computed-tile${ev.from ? '' : ' computed-tile--recalled'}` }, [
-    h('span', { class: 'computed-label' }, [ev.label]),
-    h('span', { class: 'computed-value mono' }, [formatNumberValue(ev)]),
-    h('span', { class: `computed-tag ${tagClass}` }, [tagText(ev)]),
-  ]);
-  el('computed-list').appendChild(tile);
+const unfinished = new Map<TranscriptEvent['who'], HTMLElement>();
+
+function onTranscript(ev: TranscriptEvent): void {
+  const box = el('transcript');
+  const placeholder = box.querySelector('.transcript-empty');
+  if (placeholder) placeholder.remove();
+
+  let node = unfinished.get(ev.who);
+  if (node) {
+    const text = node.querySelector('.line-text');
+    if (text) text.textContent = ev.text;
+  } else {
+    node = h('div', { class: `line line--${ev.who}` }, [
+      h('span', { class: 'line-who' }, [ev.who === 'caller' ? 'Caller' : 'Agent']),
+      h('div', { class: 'line-text' }, [ev.text]),
+    ]);
+    box.appendChild(node);
+  }
+  node.className = `line line--${ev.who}${ev.final ? '' : ' line--partial'}`;
+  if (ev.final) unfinished.delete(ev.who);
+  else unfinished.set(ev.who, node);
+
+  box.scrollTop = box.scrollHeight;
 }
 
+// ---------------------------------------------------------------------------
+// The money. One figure, the few numbers under it, and a total that a
+// viewer can add up themselves.
+
+interface MoneyLine {
+  label: string;
+  value: number;
+  from?: 'computed' | 'record' | undefined;
+  detail?: string | undefined;
+}
+
+/** The settlement breakdown, once a gate has carried one. */
+let statementLines: MoneyLine[] = [];
+/** The headline figure. Whatever the agent last worked out as the net,
+ *  carrying its own provenance: a net settlement with no source behind it
+ *  is exactly the figure that must not look authoritative. */
+let headline: MoneyLine | null = null;
+/** Everything spoken in dollars before a breakdown exists, so the panel is
+ *  not empty for the first half of the call. */
+let dollarsSoFar: MoneyLine[] = [];
+
+/**
+ * Money in whole cents.
+ *
+ * The reconciliation on screen is the claim this project makes, so it is
+ * checked in integers rather than trusted to float arithmetic: the cash
+ * breakdown sums through 21485.00, -640.00, 495.00, 1835.24, 70.00,
+ * -1000.00, -8764.12, and a float sum of those lands a fraction of a cent
+ * off 13481.12 often enough to matter.
+ */
+function sumCents(lines: readonly { value: number }[]): number {
+  let cents = 0;
+  for (const line of lines) cents += Math.round(line.value * 100);
+  return cents;
+}
+
+/** True when these lines actually add up to this figure. A total rule is
+ *  drawn only when this is true, never on the assumption that a breakdown
+ *  in hand belongs to the figure above it. */
+function reconciles(lines: readonly { value: number }[], total: number): boolean {
+  return lines.length > 0 && sumCents(lines) === Math.round(total * 100);
+}
+
+function statementRow(line: MoneyLine): HTMLLIElement {
+  const unsourced = line.from === undefined;
+  return h('li', { class: `stmt-row${unsourced ? ' stmt-row--unsourced' : ''}` }, [
+    h('span', { class: 'stmt-label' }, [line.label]),
+    h('span', { class: 'stmt-value mono' }, [formatUsd(line.value)]),
+  ]);
+}
+
+function totalRow(label: string, value: number): HTMLLIElement {
+  return h('li', { class: 'stmt-row stmt-row--total' }, [
+    h('span', { class: 'stmt-label' }, [label]),
+    h('span', { class: 'stmt-value mono' }, [formatUsd(value)]),
+  ]);
+}
+
+function renderMoney(): void {
+  const money = el('money');
+  const lines = statementLines.length > 0 ? statementLines : dollarsSoFar;
+
+  if (headline === null && lines.length === 0) {
+    money.replaceChildren(
+      h('div', { class: 'money-figure money-figure--none' }, ['Not worked out yet']),
+      h('div', { class: 'money-caption' }, ['The agent is still gathering the facts.']),
+    );
+    return;
+  }
+
+  const children: Node[] = [];
+  if (headline) {
+    const unsourced = headline.from === undefined;
+    children.push(
+      h('div', { class: `money-figure mono${unsourced ? ' money-figure--unsourced' : ''}` }, [
+        formatUsd(headline.value),
+      ]),
+    );
+    children.push(
+      h('div', { class: `money-caption${unsourced ? ' money-caption--unsourced' : ''}` }, [
+        unsourced ? `${headline.label}, with nothing behind it. Do not say this figure.` : headline.label,
+      ]),
+    );
+  } else {
+    children.push(h('div', { class: 'money-figure money-figure--none' }, ['Still adding up']));
+    children.push(h('div', { class: 'money-caption' }, ['These are the numbers so far.']));
+  }
+
+  const rows = lines.map(statementRow);
+  // A total rule is drawn only when these lines genuinely add up to the
+  // figure above them. A breakdown from an earlier option, still in hand
+  // when a new net settlement lands, would otherwise be totalled as though
+  // it belonged to it, which is the one thing this panel must never do.
+  if (headline && reconciles(lines, headline.value)) rows.push(totalRow('What we pay', headline.value));
+  children.push(h('ul', { class: 'statement' }, rows));
+
+  // Provenance, kept and demoted. A viewer who wants the proof opens this;
+  // a viewer watching the call is not made to read it. The headline is in
+  // here too: the figure the caller is actually offered is the last one that
+  // should be exempt from having to say where it came from.
+  const provLines = headline ? [headline, ...lines] : lines;
+  children.push(
+    h('details', { class: 'provenance' }, [
+      h('summary', {}, ['Where each number came from']),
+      h(
+        'ul',
+        { class: 'prov-list' },
+        provLines.map((line) =>
+          h('li', { class: 'prov-row' }, [
+            h('div', { class: 'prov-label' }, [line.label]),
+            h('div', { class: 'prov-detail' }, [
+              provenanceWords(line.from) + (line.detail ? `. ${line.detail}` : '.'),
+            ]),
+          ]),
+        ),
+      ),
+    ]),
+  );
+
+  money.replaceChildren(...children);
+}
+
+function onNumber(ev: NumberEvent): void {
+  activityOverride = null;
+  if (/^net settlement/i.test(ev.label)) {
+    headline = {
+      label: ev.label,
+      value: ev.value,
+      from: ev.from,
+      detail: ev.from === 'record' ? ev.source : ev.run_id,
+    };
+    settlementKnown = true;
+  } else if (ev.unit === 'usd') {
+    dollarsSoFar.push({
+      label: ev.label,
+      value: ev.value,
+      from: ev.from,
+      detail: ev.from === 'record' ? ev.source : ev.run_id,
+    });
+  }
+  renderMoney();
+  applyScreen();
+}
+
+function adoptBreakdown(breakdown: SettleLine[]): void {
+  if (breakdown.length === 0) return;
+  statementLines = breakdown.map((line) => ({
+    label: line.label,
+    value: line.value,
+    from: line.from,
+    detail: line.detail,
+  }));
+  renderMoney();
+}
 
 // ---------------------------------------------------------------------------
 // Releasing a gate.
@@ -247,13 +549,13 @@ function writeToken(token: string): void {
 
 let memoryToken: string | null = null;
 
+const gateClient = createGateClient({ token: () => readToken() ?? memoryToken });
+
 const liveTransport: GateTransport = {
   live: true,
   approve: (gate) => gateClient.approve(gate.id),
   sendBack: (gate, reason) => gateClient.sendBack(gate.id, reason),
 };
-
-const gateClient = createGateClient({ token: () => readToken() ?? memoryToken });
 
 const replayTransport: GateTransport = {
   live: false,
@@ -272,7 +574,7 @@ let gateTransport: GateTransport = replayTransport;
 // ---------------------------------------------------------------------------
 // How long the caller has been held by THIS gate.
 //
-// The hold clock in the header counts every kind of dead air. This one counts
+// The header's hold clock counts every kind of dead air. This one counts
 // only the part an operator is causing by not deciding, which is the number
 // that should make them uncomfortable.
 
@@ -282,7 +584,7 @@ let gateHeldEl: HTMLElement | null = null;
 function tickGateHold(): void {
   if (!gateHeldEl || gateOpenedAtCallTime === null) return;
   const heldMs = Math.max(0, virtualNow() - gateOpenedAtCallTime);
-  gateHeldEl.textContent = `The caller has been waiting ${formatClock(heldMs)} on this decision.`;
+  gateHeldEl.textContent = `The caller has been waiting ${formatClock(heldMs)} on this.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +632,6 @@ function wordDiff(before: string, after: string): DiffPart[] {
 }
 
 function renderWordDiff(before: string, after: string): HTMLElement[] {
-  if (before === after) return [h('span', { class: 'diff-same' }, ['no change from the draft'])];
   return wordDiff(before, after).map((part) => {
     if (part.kind === 'removed') return h('del', { class: 'diff-removed' }, [part.text]);
     if (part.kind === 'added') return h('ins', { class: 'diff-added' }, [part.text]);
@@ -348,86 +649,110 @@ interface GateState {
 }
 
 let currentGate: GateState | null = null;
+/** Dismisses the resolved-gate card after it has been read. Cleared on any
+ *  new gate so a fast redraft cannot be wiped by the previous one's timer. */
+let gateDismissTimer: ReturnType<typeof setTimeout> | null = null;
 
-function renderBreakdownRow(line: SettleLine): HTMLLIElement {
-  return h('li', { class: 'breakdown-row' }, [
-    h('span', { class: 'breakdown-label' }, [line.label]),
-    h('span', { class: 'breakdown-value mono' }, [formatUsd(line.value)]),
-    h('span', { class: `computed-tag tag--${line.from}` }, [line.from]),
-  ]);
+function showGateLayer(): void {
+  if (gateDismissTimer !== null) {
+    clearTimeout(gateDismissTimer);
+    gateDismissTimer = null;
+  }
+  // Nothing takes the screen over a call that has ended. A decision already
+  // in flight when the caller hangs up still resolves and still lands in the
+  // decision list; it just does not put a modal back over a dead line.
+  if (!callLive) return;
+  el('gate-layer').hidden = false;
+}
+
+function hideGateLayerAfter(ms: number): void {
+  if (gateDismissTimer !== null) clearTimeout(gateDismissTimer);
+  gateDismissTimer = setTimeout(() => {
+    el('gate-layer').hidden = true;
+    gateDismissTimer = null;
+  }, ms);
 }
 
 function renderGateOpen(gate: GateState): void {
-  el('gate-empty').hidden = true;
-  const content = el('gate-content');
-  content.hidden = false;
-  content.replaceChildren();
+  showGateLayer();
+  const card = el('gate');
+  card.className = 'gate';
+  card.replaceChildren();
 
-  content.appendChild(
-    h('div', { class: 'gate-alert' }, ['HIGH RISK: BINDING SETTLEMENT OFFER, IRREVERSIBLE ONCE APPROVED']),
+  card.appendChild(h('div', { class: 'gate-eyebrow' }, ['Needs you now']));
+  card.appendChild(
+    h('h2', { class: 'gate-h', id: 'gate-heading' }, ['The agent wants to make a binding offer']),
   );
   // TrueForge answers any further caller utterance with 422 while a gate is
   // open. This is not a hold in the ordinary sense, the line is stopped, so
   // the console says that plainly rather than leaving it implied.
-  content.appendChild(
-    h('div', { class: 'gate-halted' }, ['The line is halted. The caller cannot be spoken to again until this resolves.']),
+  card.appendChild(
+    h('p', { class: 'gate-sub' }, [
+      'Nothing is said to the caller until you decide. The line is silent right now.',
+    ]),
   );
-  // Dead air an operator is causing by not deciding yet, counted separately
-  // from the call's own hold clock so it cannot hide inside it.
-  gateHeldEl = h('div', { class: 'gate-held mono' }, ['The caller has been waiting 0:00 on this decision.']);
-  content.appendChild(gateHeldEl);
-  content.appendChild(h('div', { class: 'gate-meta mono' }, [`gate ${gate.id}  ·  ${gate.tool}`]));
 
-  content.appendChild(h('label', { class: 'field-label' }, ['Draft utterance, editable']));
-  const textarea = h('textarea', { class: 'gate-wanted', rows: '4' });
+  card.appendChild(h('label', { class: 'field-label', for: 'gate-say' }, ['What the agent wants to say']));
+  const textarea = h('textarea', { class: 'gate-say', id: 'gate-say', rows: '3' });
   textarea.value = gate.wanted;
-  content.appendChild(textarea);
+  card.appendChild(textarea);
 
-  content.appendChild(h('label', { class: 'field-label' }, ['Change from what the agent drafted']));
-  const diff = h('div', { class: 'gate-diff' });
-  content.appendChild(diff);
+  // The change block stays out of the way until there is a change to show.
+  // A viewer watching a demo should not be reading "no change from the
+  // draft" on a draft nobody has touched.
+  const changeWrap = h('div', {}, [
+    h('span', { class: 'field-label' }, ['What you changed']),
+    h('div', { class: 'gate-change' }),
+  ]);
+  changeWrap.hidden = true;
+  card.appendChild(changeWrap);
+  const changeBox = changeWrap.querySelector('.gate-change') as HTMLElement;
 
-  content.appendChild(h('label', { class: 'field-label' }, ['Settlement breakdown']));
-  const breakdownList = h(
-    'ul',
-    { class: 'breakdown-list' },
-    gate.breakdown.map(renderBreakdownRow),
-  );
-  content.appendChild(breakdownList);
-
-  content.appendChild(h('label', { class: 'field-label' }, ['Source records']));
-  content.appendChild(h('div', { class: 'sources-row mono' }, [gate.sources.join('   ·   ')]));
-
-  if (gate.authorisedAmounts.length > 0) {
-    content.appendChild(
-      h('div', { class: 'authorised-row mono' }, [
-        `pre-authorises: ${gate.authorisedAmounts.map(formatUsd).join(', ')}`,
-      ]),
-    );
-  }
-
-  content.appendChild(h('label', { class: 'field-label' }, ['Reason, if you are sending it back']));
+  const left = h('div', {});
+  left.appendChild(h('label', { class: 'field-label', for: 'gate-reason' }, ['If you send it back, say why']));
   const reasonBox = h('textarea', {
-    class: 'gate-reason-input',
-    rows: '2',
-    placeholder: 'the agent reads this and redrafts from it',
+    class: 'gate-reason',
+    id: 'gate-reason',
+    rows: '3',
+    placeholder: 'The agent reads this and writes the offer again.',
   });
-  content.appendChild(reasonBox);
+  left.appendChild(reasonBox);
 
-  const btnApprove = h('button', { class: 'btn btn--approve' }, ['Approve']);
-  const btnApproveEdits = h('button', { class: 'btn btn--approve-edits is-inactive' }, ['Approve with edits']);
+  const btnApprove = h('button', { class: 'btn btn--approve' }, ['Approve and say it']);
+  const btnApproveEdits = h('button', { class: 'btn btn--approve-edits is-inactive' }, ['Approve my wording']);
   btnApproveEdits.disabled = true;
-  const btnSendBack = h('button', { class: 'btn btn--send-back' }, ['Send back to recompute']);
-  content.appendChild(h('div', { class: 'gate-buttons' }, [btnApprove, btnApproveEdits, btnSendBack]));
+  const btnSendBack = h('button', { class: 'btn btn--send-back' }, ['Send back']);
+  gateHeldEl = h('span', { class: 'gate-waiting mono' }, ['The caller has been waiting 0:00 on this.']);
+  left.appendChild(
+    h('div', { class: 'gate-buttons' }, [btnApprove, btnApproveEdits, btnSendBack, gateHeldEl]),
+  );
 
-  const status = h('div', { class: 'gate-status mono' });
-  content.appendChild(status);
+  const status = h('div', { class: 'gate-status' });
+  left.appendChild(status);
 
   if (gateTransport.live && (readToken() ?? memoryToken) === null) {
-    renderTokenRow(content, () => {
-      say('token held for this tab. the buttons will reach the server now.');
+    renderTokenRow(left, () => {
+      say('Token held for this tab. The buttons will reach the server now.');
     });
   }
+
+  const right = h('div', {});
+  right.appendChild(h('span', { class: 'field-label' }, ['How the figure adds up']));
+  const rows = gate.breakdown.map((line) =>
+    statementRow({ label: line.label, value: line.value, from: line.from, detail: line.detail }),
+  );
+  // The total is the sum of the lines shown, not the first pre-authorised
+  // amount. A draft that offers two options pre-authorises both, and the
+  // one the breakdown describes is not always the first: gate 2's salvage
+  // lines come to 9,180.12 while `authorised_amounts[0]` is 13,481.12, so
+  // reading position zero printed a reconciliation that was false on its
+  // face.
+  if (gate.breakdown.length > 0) {
+    rows.push(totalRow('These lines add up to', sumCents(gate.breakdown) / 100));
+  }
+  right.appendChild(h('ul', { class: 'statement' }, rows));
+
+  card.appendChild(h('div', { class: 'gate-cols' }, [left, right]));
 
   function say(message: string, bad = false): void {
     status.textContent = message;
@@ -443,17 +768,17 @@ function renderGateOpen(gate: GateState): void {
    * failed, because a failed decision means the caller is still waiting.
    */
   let deciding = false;
-  async function decide(what: 'approve' | 'send back', run: () => Promise<GateResult>): Promise<void> {
+  async function decide(what: 'approval' | 'send back', run: () => Promise<GateResult>): Promise<void> {
     if (deciding) return;
     deciding = true;
     const wasDisabled = [btnApprove.disabled, btnApproveEdits.disabled, btnSendBack.disabled];
     btnApprove.disabled = true;
     btnApproveEdits.disabled = true;
     btnSendBack.disabled = true;
-    say(`sending the ${what}...`);
+    say(`Sending the ${what}...`);
     const result = await run();
     if (result.ok) {
-      say(gateTransport.live ? `${what} sent. releasing the caller.` : `${what} recorded.`);
+      say(gateTransport.live ? `${what} sent. Releasing the caller.` : `${what} recorded.`);
       return;
     }
     deciding = false;
@@ -463,61 +788,56 @@ function renderGateOpen(gate: GateState): void {
     say(result.error, true);
   }
 
-  const renderDiff = (): void => diff.replaceChildren(...renderWordDiff(gate.wanted, textarea.value));
-  renderDiff();
-
   // Editing the draft swaps which button is live: an edited draft cannot be
-  // rubber-stamped through the plain "Approve" path, it has to go through
-  // "Approve with edits". Both buttons stay in the layout and cross-fade
-  // (see .is-inactive in index.html) rather than popping in and out, so the
-  // swap itself is a piece of feedback, not a layout jump.
+  // rubber-stamped through the plain approve path, it has to go through the
+  // one that names the edit. Both buttons stay in the layout and cross-fade
+  // rather than popping in and out, so the swap itself is feedback.
   textarea.addEventListener('input', () => {
-    renderDiff();
     const unedited = textarea.value === gate.wanted;
     const empty = textarea.value.trim() === '';
+    changeWrap.hidden = unedited;
+    if (!unedited) changeBox.replaceChildren(...renderWordDiff(gate.wanted, textarea.value));
     const approveInactive = !unedited || empty;
     const editsInactive = unedited || empty;
     // The class drives the fade; `disabled` is what actually matters. A
     // button hidden only by opacity and pointer-events is still in the tab
     // order and still fires on Enter or Space, so an operator tabbing
-    // through the gate could invoke the plain "Approve" path on an edited
-    // draft, or "Approve with edits" before anything was edited. Setting
-    // `disabled` closes both: out of the tab order, and inert to any input.
+    // through the gate could invoke the plain approve path on an edited
+    // draft. Setting `disabled` closes that: out of the tab order, and inert.
     btnApprove.classList.toggle('is-inactive', approveInactive);
     btnApprove.disabled = approveInactive;
     btnApproveEdits.classList.toggle('is-inactive', editsInactive);
     btnApproveEdits.disabled = editsInactive;
     // An emptied draft cannot be approved by either path: there is nothing
     // left to speak, and a blank binding utterance is not a smaller version
-    // of the offer, it is a different failure than the one this button row
-    // already guards against.
+    // of the offer, it is a different failure.
     btnSendBack.classList.toggle('is-emphasised', empty);
   });
 
   // Live, an edited draft cannot be approved at all.
   //
   // The wire settles a gate on allow or deny and carries no wording, so an
-  // "approve with edits" would send the ORIGINAL sentence while the operator
+  // "approve my wording" would send the ORIGINAL sentence while the operator
   // watched their own edit on screen and believed it had been authorised.
   // That is a worse failure than the missing button. An edit goes back for a
   // redraft instead, and the edited text is offered as the reason, which is
   // exactly what the agent needs to write the next draft.
   if (gateTransport.live) {
-    btnApproveEdits.title = 'editing a draft sends it back for a redraft on this wire';
+    btnApproveEdits.title = 'On a live call, an edit goes back to the agent to say in its own turn.';
   }
 
   btnApprove.addEventListener('click', () => {
-    void decide('approve', () => gateTransport.approve(gate, textarea.value));
+    void decide('approval', () => gateTransport.approve(gate, textarea.value));
   });
   btnApproveEdits.addEventListener('click', () => {
     if (gateTransport.live) {
       reasonBox.value = reasonBox.value.trim() === ''
-        ? `use this wording instead: ${textarea.value.trim()}`
+        ? `Use this wording instead: ${textarea.value.trim()}`
         : reasonBox.value;
-      say('edited drafts go back for a redraft. the wording is in the reason below.', true);
+      say('Edited wording goes back to the agent. It is in the reason box below.', true);
       return;
     }
-    void decide('approve', () => gateTransport.approve(gate, textarea.value));
+    void decide('approval', () => gateTransport.approve(gate, textarea.value));
   });
   btnSendBack.addEventListener('click', () => {
     void decide('send back', () => gateTransport.sendBack(gate, reasonBox.value));
@@ -525,37 +845,47 @@ function renderGateOpen(gate: GateState): void {
 }
 
 function renderGateApproved(ev: GateEvent): void {
-  el('gate-empty').hidden = true;
-  const content = el('gate-content');
-  content.hidden = false;
-  const rows: Array<Node | string> = [
-    h('div', { class: 'gate-alert gate-alert--approved' }, [
-      ev.auto ? 'AUTO-APPROVED, PRE-AUTHORISED AMOUNT' : 'APPROVED, SPOKEN VERBATIM',
-    ]),
-    h('div', { class: 'gate-meta mono' }, [`gate ${ev.id}  ·  ${ev.tool}`]),
+  showGateLayer();
+  const card = el('gate');
+  card.className = 'gate gate--settled';
+  card.replaceChildren(
+    h('div', { class: 'gate-eyebrow' }, [ev.auto ? 'Approved automatically' : 'You approved it']),
+    h('h2', { class: 'gate-h', id: 'gate-heading' }, ['The agent said this to the caller']),
     h('p', { class: 'gate-said' }, [ev.said ?? '']),
-  ];
-  if (ev.reason) rows.push(h('p', { class: 'gate-reason' }, [ev.reason]));
-  content.replaceChildren(...rows);
+    ...(ev.reason ? [h('p', { class: 'gate-sub' }, [ev.reason])] : []),
+  );
+  hideGateLayerAfter(3200);
+}
+
+function renderGateSentBack(ev: GateEvent): void {
+  showGateLayer();
+  const card = el('gate');
+  card.className = 'gate gate--settled';
+  card.replaceChildren(
+    h('div', { class: 'gate-eyebrow' }, ['You sent it back']),
+    h('h2', { class: 'gate-h', id: 'gate-heading' }, ['The agent is writing the offer again']),
+    ...(ev.reason ? [h('p', { class: 'gate-sub' }, [ev.reason])] : []),
+  );
+  hideGateLayerAfter(2400);
 }
 
 /**
  * Asks for the operator token, once per tab.
  *
- * Rendered in the gate pane rather than at page load, so a console that is
+ * Rendered in the gate card rather than at page load, so a console that is
  * only being watched never asks for a credential it does not need. Deciding
  * a gate needs one; watching a call does not.
  */
 function renderTokenRow(parent: HTMLElement, onStored: () => void): void {
   const row = h('div', { class: 'gate-token' });
-  row.appendChild(h('label', { class: 'field-label' }, ['Operator token, to decide a gate']));
+  row.appendChild(h('span', { class: 'field-label' }, ['Operator token, to decide a gate']));
   const input = h('input', {
     class: 'gate-token-input mono',
     type: 'password',
     placeholder: 'TELEPHONY_SHARED_SECRET from .env.local',
     autocomplete: 'off',
   });
-  const save = h('button', { class: 'btn btn--approve-edits' }, ['Hold for this tab']);
+  const save = h('button', { class: 'btn' }, ['Hold for this tab']);
   save.addEventListener('click', () => {
     const value = input.value.trim();
     if (value === '') return;
@@ -567,15 +897,13 @@ function renderTokenRow(parent: HTMLElement, onStored: () => void): void {
   parent.appendChild(row);
 }
 
-function renderGateAwaiting(message: string): void {
-  el('gate-content').hidden = true;
-  const empty = el('gate-empty');
-  empty.hidden = false;
-  empty.textContent = message;
-}
-
-function logGateHistory(t: number, id: string, label: string): void {
-  el('gate-history').appendChild(h('li', { class: 'gate-history-row mono' }, [`${formatClock(t)}  ${id}  ${label}`]));
+function logDecision(t: number, words: string): void {
+  el('decisions').appendChild(
+    h('li', { class: 'decision' }, [
+      h('span', { class: 'decision-t mono' }, [formatClock(t)]),
+      h('span', {}, [words]),
+    ]),
+  );
 }
 
 /**
@@ -594,7 +922,7 @@ function resolveGateLocally(gate: GateState, said: string): void {
 function sendBackLocally(gate: GateState, reason: string): void {
   dispatch({
     type: 'gate', t: virtualNow(), id: gate.id, tool: gate.tool, status: 'sent_back',
-    reason: reason.trim() === '' ? 'sent back to recompute (operator)' : reason.trim(),
+    reason: reason.trim() === '' ? 'Sent back to work out again.' : reason.trim(),
   });
 }
 
@@ -608,72 +936,169 @@ function onGate(ev: GateEvent): void {
       sources: ev.sources ?? [],
       authorisedAmounts: ev.authorised_amounts ?? [],
     };
+    adoptBreakdown(currentGate.breakdown);
     gateOpenedAtCallTime = ev.t;
+    gateIsOpen = true;
+    activityOverride = null;
     renderGateOpen(currentGate);
+    applyScreen();
     tickGateHold();
-    logGateHistory(ev.t, ev.id, 'opened');
+    logDecision(ev.t, 'Offer put in front of you');
     return;
   }
 
+  gateOpenedAtCallTime = null;
+  gateHeldEl = null;
+  gateIsOpen = false;
+
   if (ev.status === 'sent_back') {
-    gateOpenedAtCallTime = null;
-    gateHeldEl = null;
-    renderGateAwaiting(ev.reason ? `Sent back to recompute. ${ev.reason}` : 'Sent back to recompute.');
-    logGateHistory(ev.t, ev.id, 'sent back');
+    activityOverride = 'Writing the offer again';
+    renderGateSentBack(ev);
+    logDecision(ev.t, 'You sent the offer back');
     if (currentGate?.id === ev.id) currentGate = null;
+    applyScreen();
     return;
   }
 
   // 'approved'. gate-3 in the recording has no prior 'opened' at all: it
   // resolves straight from a pre-authorisation, which is the point of
   // scoping one.
-  gateOpenedAtCallTime = null;
-  gateHeldEl = null;
+  activityOverride = null;
   renderGateApproved(ev);
-  logGateHistory(ev.t, ev.id, ev.auto ? 'auto-approved' : 'approved');
+  logDecision(
+    ev.t,
+    ev.auto ? 'Approved on its own, inside an amount you already approved' : 'You approved the offer',
+  );
   if (currentGate?.id === ev.id) currentGate = null;
+  applyScreen();
 }
 
 // ---------------------------------------------------------------------------
 // Call header and session banner.
 
+/**
+ * Everything one call put on the screen, cleared for the next one.
+ *
+ * A console left open on a live line takes a second call on the same page,
+ * and without this the new caller's screen opens on the previous caller's
+ * dialogue and the previous caller's offer, overwritten only piecemeal as
+ * new events happen to land on the same rows.
+ */
+function resetForNewCall(started: ConsoleEvent): void {
+  state.events.length = 0;
+  state.events.push(started);
+  gateResolutions.clear();
+
+  lanes.clear();
+  el('steps').replaceChildren();
+  el('together').hidden = true;
+  el('decisions').replaceChildren();
+
+  unfinished.clear();
+  el('transcript').replaceChildren(h('p', { class: 'transcript-empty' }, ['Nothing said yet.']));
+
+  statementLines = [];
+  dollarsSoFar = [];
+  headline = null;
+  settlementKnown = false;
+  activityOverride = null;
+
+  holdRunning = false;
+  holdAccumulatedMs = 0;
+  holdStartedAtCallTime = 0;
+
+  currentGate = null;
+  gateIsOpen = false;
+  gateOpenedAtCallTime = null;
+  gateHeldEl = null;
+  if (gateDismissTimer !== null) {
+    clearTimeout(gateDismissTimer);
+    gateDismissTimer = null;
+  }
+  el('gate-layer').hidden = true;
+
+  renderMoney();
+}
+
 function onCall(ev: CallEvent): void {
-  const pill = el('call-status');
   if (ev.status === 'started') {
-    el('claim-id').textContent = ev.claim_id ?? '';
-    el('caller-name').textContent = ev.caller ?? '';
-    pill.textContent = 'ON CALL';
-    pill.className = 'pill pill--live';
+    resetForNewCall(ev);
+    callEverStarted = true;
+    callLive = true;
+    callEndedAtCallTime = null;
+    el('caller-name').textContent = ev.caller ?? 'Caller';
+    // "Claim CLM-40218" says claim twice. The caller and the agent both call
+    // it claim 40218, so the screen does too.
+    el('claim-line').textContent = ev.claim_id ? `Claim ${ev.claim_id.replace(/^CLM-/i, '')}` : '';
+    applyScreen();
     return;
   }
-  pill.textContent = 'CALL ENDED, COUNTERS HELD';
-  pill.className = 'pill pill--ended';
-  el('counters').classList.add('counters--final');
+  callLive = false;
+  gateIsOpen = false;
   callEndedAtCallTime = ev.t;
+  if (gateDismissTimer !== null) {
+    clearTimeout(gateDismissTimer);
+    gateDismissTimer = null;
+  }
+  el('gate-layer').hidden = true;
+  applyScreen();
 }
 
 function onSession(ev: SessionEvent): void {
-  const pill = el('session-pill');
-  pill.hidden = false;
   if (ev.status === 'suspended') {
-    pill.textContent = `SESSION ${ev.session_id.toUpperCase()} SUSPENDED`;
-    pill.className = 'pill pill--suspended';
-    return;
+    activityOverride = 'The line dropped. Everything is being held.';
+    logDecision(ev.t, 'The line dropped');
+  } else {
+    activityOverride = 'Back on the line. Nothing was worked out again.';
+    logDecision(ev.t, 'Caller rang back, nothing recalculated');
   }
-  const runIds = ev.run_ids ?? [];
-  pill.textContent = `RESUMED, same run ids (${runIds.join(', ')}), nothing recomputed`;
-  pill.className = 'pill pill--resumed';
+  applyScreen();
 }
 
 // ---------------------------------------------------------------------------
-// Counters footer, Task 8. Generated from the run log on every event, never
+// Counters footer. Generated from the run log on every event, never
 // hard-coded, and held (not cleared) once the call ends.
 
 function renderCounters(): void {
-  const numberTally = tally(numbersFromEvents(state.events));
-  const utteranceTally = tallyUtterances(utterancesFromEvents(state.events));
-  el('counter-numbers').textContent = formatNumberLine(numberTally);
-  el('counter-utterances').textContent = formatUtteranceLine(utteranceTally);
+  const n = tally(numbersFromEvents(state.events));
+  const u = tallyUtterances(utterancesFromEvents(state.events));
+
+  el('counter-numbers').textContent =
+    n.spoken === 0
+      ? 'No numbers said yet.'
+      : n.recalled > 0
+        ? `${n.spoken} numbers said, and ${n.recalled} of them has no source.`
+        : `${n.spoken} numbers said, every one traced to a source.`;
+
+  el('counter-utterances').textContent =
+    u.binding === 0
+      ? 'No binding sentences yet.'
+      : u.spokenUnapproved > 0
+        ? `${u.binding} binding sentences, ${u.spokenUnapproved} said without approval.`
+        : `${u.binding} binding ${u.binding === 1 ? 'sentence' : 'sentences'}, all approved before they were said.`;
+}
+
+// ---------------------------------------------------------------------------
+// The harness indicator. Quiet, and never says more than it knows.
+
+function setHarness(kind: 'up' | 'replay' | 'down' | 'wait', words: string): void {
+  const node = el('harness');
+  node.className = `harness harness--${kind}`;
+  node.textContent = words;
+}
+
+async function nameTheHarness(): Promise<void> {
+  try {
+    const res = await fetch('/health');
+    if (!res.ok) return;
+    const body = (await res.json()) as { agent?: unknown };
+    if (typeof body.agent === 'string' && body.agent !== '') {
+      setHarness('up', `TrueForge harness connected · ${body.agent}`);
+    }
+  } catch {
+    // The indicator already says what the event stream is doing. A failed
+    // health probe is not worth contradicting it over.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +1136,10 @@ function branchRequirement(ev: ConsoleEvent): { gateId: string; status: GateEven
     return { gateId: 'gate-1', status: 'sent_back' };
   }
   if (ev.type === 'number' && ev.label === 'Offer validity') return { gateId: 'gate-1', status: 'sent_back' };
+  // Everything said after the second gate resolves was said BECAUSE it
+  // resolved that way. On the branch where an operator approves the first
+  // draft instead, none of it happened, so none of it is transcribed.
+  if (ev.type === 'transcript' && ev.t >= 102_000) return { gateId: 'gate-2', status: 'approved' };
   return null;
 }
 
@@ -744,6 +1173,9 @@ function dispatch(ev: ConsoleEvent): void {
       break;
     case 'session':
       onSession(ev);
+      break;
+    case 'transcript':
+      onTranscript(ev);
       break;
   }
   renderCounters();
@@ -787,6 +1219,16 @@ function syncClockToLive(t: number): void {
 
 function startLive(url: string): void {
   const source = new EventSource(url);
+  setHarness('wait', 'Reaching the TrueForge harness');
+  source.addEventListener('open', () => {
+    setHarness('up', 'TrueForge harness connected');
+    void nameTheHarness();
+  });
+  source.addEventListener('error', () => {
+    // EventSource reconnects on its own. Say what is true right now rather
+    // than claiming a connection the browser is still retrying.
+    setHarness('down', 'Lost the harness, reconnecting');
+  });
   const onMessage = (msgEvent: MessageEvent): void => {
     let parsed: unknown;
     try {
@@ -798,17 +1240,21 @@ function startLive(url: string): void {
     syncClockToLive(parsed.t);
     dispatch(parsed);
   };
-  const types: ConsoleEvent['type'][] = ['lane', 'lanes_summary', 'number', 'gate', 'hold', 'session', 'call'];
+  const types: ConsoleEvent['type'][] = [
+    'lane', 'lanes_summary', 'number', 'gate', 'hold', 'session', 'call', 'transcript',
+  ];
   for (const type of types) source.addEventListener(type, onMessage);
 }
 
 function main(): void {
+  applyScreen();
+  renderMoney();
   setInterval(tickClocks, 250);
 
   const params = new URLSearchParams(window.location.search);
 
   // Demo replay requires an explicit ?demo param, or ?speed / ?until.
-  // Without any of those, the console connects live to /events so the
+  // Without any of those, the console connects live to /sse so the
   // operator sees real call data the moment they open the page.
   const demo = params.has('demo');
   const speedParam = params.get('speed');
@@ -819,6 +1265,7 @@ function main(): void {
     const until = untilParam !== null && untilParam !== '' ? Number(untilParam) : null;
     // A recording has no caller to release, so a click resolves it here.
     gateTransport = replayTransport;
+    setHarness('replay', 'Replaying a recorded call. Not a live line.');
     startReplay(recordedNorthvaneCall(), speed, until);
     return;
   }
