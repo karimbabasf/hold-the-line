@@ -30,6 +30,7 @@ import {
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 
+import type { ConsoleEventBody } from '../console/events.ts';
 import {
   loadClaim,
   loadComps,
@@ -39,6 +40,8 @@ import {
 } from '../data/fixtures.ts';
 import { daysBetween, settle } from '../settle/settle.ts';
 import { LANES, type LaneDef } from './lanes.ts';
+import { reportEvent } from './report.ts';
+import { createLaneWindow, laneNameFor, numbersFrom, summarise } from './telemetry.ts';
 import {
   approveGate,
   coverageDeny,
@@ -54,6 +57,77 @@ import {
 
 const toCents = (dollars: number): number => Math.round(dollars * 100);
 const toDollars = (cents: number): number => cents / 100;
+
+// ---------------------------------------------------------------------------
+// Reporting to the operator console.
+//
+// This process runs the tools; a different process (telephony, 8791) holds
+// the console's SSE clients, because TrueForge takes MCP servers by remote URL
+// only and so the two cannot be one process. Nothing crossed that gap before,
+// which is why every pane these tools should fill stayed empty on a live call
+// and only ever filled from the recorded fixture.
+//
+// `report` is a mutable binding rather than a direct call so a test can watch
+// what a real tool call puts on screen without an HTTP listener in the way.
+// It is never a way to turn reporting off in production: the default is the
+// real reporter, and that one is already inert when unconfigured.
+// ---------------------------------------------------------------------------
+
+type ConsoleReport = (event: ConsoleEventBody) => void;
+
+let report: ConsoleReport = reportEvent;
+
+/** Redirects reported console events. Returns the previous sink, so a test
+ *  can put it back. */
+export function setConsoleReport(sink: ConsoleReport): ConsoleReport {
+  const previous = report;
+  report = sink;
+  return previous;
+}
+
+const laneWindow = createLaneWindow({ report: (event) => { report(event); } });
+
+/**
+ * Tools that are a container for other tool calls rather than a lookup of
+ * their own. Reporting `claim.snapshot` as a lane as well as the six lookups
+ * it fans out would count its wall time twice in the serial figure and make
+ * the parallel-versus-serial counter claim more than actually happened.
+ */
+const CONTAINER_TOOLS: ReadonlySet<string> = new Set(['claim.snapshot']);
+
+let toolRunCounter = 0;
+/** Provenance for a figure this tool call computed. Prefixed so it can never
+ *  be read as one of `settle()`'s own run ids on screen. */
+const nextToolRun = (name: string): string =>
+  `tool-${name}-${(toolRunCounter++).toString(36)}`;
+
+/** Reports one tool's lane opening. Returns the function that closes it. */
+function openLane(name: string, runId: string): (result: unknown, error?: unknown) => void {
+  if (CONTAINER_TOOLS.has(name)) return () => {};
+  const laneName = laneNameFor(name);
+  const startedAt = performance.now();
+  laneWindow.began();
+  report({ type: 'lane', name: laneName, tool: name, status: 'pending' });
+
+  return (result: unknown, error?: unknown) => {
+    const elapsed = Math.round(performance.now() - startedAt);
+    laneWindow.ended(elapsed);
+    const summary =
+      error === undefined
+        ? summarise(name, result)
+        : `failed: ${error instanceof Error ? error.message : String(error)}`;
+    report({
+      type: 'lane',
+      name: laneName,
+      tool: name,
+      status: 'done',
+      elapsed_ms: elapsed,
+      ...(summary ? { summary } : {}),
+    });
+    if (error !== undefined) return;
+    for (const number of numbersFrom(name, result, runId)) report(number);
+  };
+}
 
 // ---------------------------------------------------------------------------
 // The eight SAFE tools (spec section 6). Each reads Task 2's fixture loader;
@@ -207,28 +281,43 @@ export async function claimSnapshot(args: { claim_id: string }) {
   const started = Date.now();
   const timings: Array<{ lane: string; elapsed_ms: number }> = [];
 
-  async function lane<T>(name: string, fn: () => T): Promise<T> {
+  /**
+   * One inner lookup: timed for the caller's own counter, and reported to
+   * the console as its own lane. These are the lanes the operator watches on
+   * a real call, since the agent is told to start here rather than call the
+   * six lookups one by one.
+   */
+  async function lane<T>(tool: string, fn: () => T): Promise<T> {
+    const runId = nextToolRun(tool);
+    const closeLane = openLane(tool, runId);
     const t0 = Date.now();
-    const out = await Promise.resolve(fn());
-    timings.push({ lane: name, elapsed_ms: Date.now() - t0 });
-    return out;
+    try {
+      const out = await Promise.resolve(fn());
+      timings.push({ lane: tool, elapsed_ms: Date.now() - t0 });
+      closeLane(out);
+      return out;
+    } catch (err) {
+      timings.push({ lane: tool, elapsed_ms: Date.now() - t0 });
+      closeLane(undefined, err ?? new Error('lookup failed'));
+      throw err;
+    }
   }
 
   // First hop: everything reachable from the claim id alone.
   const [claim, rules, storage] = await Promise.all([
-    lane('claim', () => claimGet(args)),
-    lane('state rules', () => stateRulesGet({ state: loadPolicy().state })),
-    lane('yard storage', () => yardStorageStatus(args)),
+    lane('claim.get', () => claimGet(args)),
+    lane('state_rules.get', () => stateRulesGet({ state: loadPolicy().state })),
+    lane('yard.storage_status', () => yardStorageStatus(args)),
   ]);
 
   // Second hop: needs the VIN, which only the claim carries.
   const [vehicle, comps] = await Promise.all([
-    lane('vehicle', () => vehicleGet({ vin: claim.vin })),
-    lane('valuation comps', () => valuationComps({ vin: claim.vin })),
+    lane('vehicle.get', () => vehicleGet({ vin: claim.vin })),
+    lane('valuation.comps', () => valuationComps({ vin: claim.vin })),
   ]);
 
   // Third hop: needs the loan id, which only the vehicle carries.
-  const payoff = await lane('lienholder payoff', () =>
+  const payoff = await lane('lienholder.payoff_quote', () =>
     lienholderPayoffQuote({ loan_id: vehicle.lien.loan_id, through_date: vehicle.lien.good_through }),
   );
 
@@ -455,13 +544,22 @@ export async function callTool(
     return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true };
   }
 
+  // The lane opens before the deliberate delay, not after it. That delay
+  // stands in for the network latency of a real claims database (see
+  // lanes.ts), so it is part of what the lane took, and the console's timing
+  // has to be the latency an operator would actually be waiting through.
+  const runId = nextToolRun(name);
+  const closeLane = openLane(name, runId);
+
   const delay = toolDelay.get(name) ?? 0;
   if (delay > 0) await sleep(delay);
 
   try {
     const result = await entry.handler(args);
+    closeLane(result);
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
+    closeLane(undefined, err ?? new Error('tool failed'));
     return {
       content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
       isError: true,

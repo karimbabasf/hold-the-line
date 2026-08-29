@@ -13,7 +13,12 @@
  */
 
 import { parseSse } from './sse.ts';
-import type { ApprovalDecision, TurnEvent, TurnInputItem } from './types.ts';
+import type {
+  ApprovalDecision,
+  ModelMessageEvent,
+  TurnEvent,
+  TurnInputItem,
+} from './types.ts';
 
 export interface TrueForgeClientOptions {
   baseUrl?: string;
@@ -109,6 +114,43 @@ export class TrueForgeClient {
         continue;
       }
       if (typeof event?.type === 'string') yield event;
+    }
+  }
+
+  /**
+   * Reads one persisted event back out of a session.
+   *
+   * A gated call's tool name and draft utterance are not on the approval
+   * event and are not on the streamed `model.message` either: the streamed
+   * copy is an empty opener carrying only an id. Only the persisted copy
+   * carries `tool_calls`, so resolving a gate means coming back for it.
+   *
+   * The listing is newest first, verified live on 2026-08-29: for a gate
+   * that just fired, its source event sits two entries down, behind
+   * `turn.done` and the approval itself. A short page is therefore enough
+   * however long the call has run, and is cheap enough to sit inside a turn.
+   *
+   * Returns undefined rather than throwing. A gate that cannot be described
+   * is still a gate that must be held, so a failed read must degrade into
+   * "the operator sees an unresolved gate", never into a call that drops or
+   * a call that speaks.
+   */
+  async findEvent(
+    sessionId: string,
+    eventId: string,
+    limit = 20,
+  ): Promise<ModelMessageEvent | undefined> {
+    try {
+      const body = await this.json<{ data?: Array<{ event?: ModelMessageEvent }> }>(
+        'GET',
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}/events?limit=${limit}`,
+      );
+      return (body.data ?? [])
+        .map((w) => w?.event)
+        .find((e): e is ModelMessageEvent => e?.id === eventId);
+    } catch (err) {
+      console.warn('could not read the event behind a gate:', err);
+      return undefined;
     }
   }
 
@@ -238,10 +280,16 @@ function assertHomogeneousInput(input: TurnInputItem[]): void {
   if (input.length === 0) throw new Error('turn input must not be empty');
 
   const hasMessage = input.some((i) => i.type === 'user.message');
-  const hasApproval = input.some((i) => i.type === 'user.tool_approval');
-  if (hasMessage && hasApproval) {
+  const hasResume = input.some(
+    (i) => i.type === 'user.tool_approval' || i.type === 'user.tool_response',
+  );
+  if (hasMessage && hasResume) {
+    // The server rejects the mix with a 422 that does not say which item is
+    // wrong, and while a thread is parked it rejects a bare message too:
+    // "user message cannot be sent while approvals or questions are
+    // pending". Failing here keeps the reason attached to the mistake.
     throw new Error(
-      'turn input must not mix user messages with approval resumes',
+      'turn input must not mix user messages with approval or question resumes',
     );
   }
 }

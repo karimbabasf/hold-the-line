@@ -56,6 +56,18 @@ instance on `:8790`.
    node --env-file=.env.local scripts/telnyx-assistant.mts --create
    ```
 6. Call the number the script prints.
+7. Open the operator console at `http://localhost:8791/console`. It connects live by
+   default. `?demo` replays the recorded call instead, `?speed=20` replays it faster and
+   `?until=71000` freezes it at a point in call time.
+
+`./scripts/start.sh` does steps 3 to 5 for you and is the shorter path.
+
+The claim tools run in their own process on `:8792`, because TrueForge takes MCP servers by
+remote URL only. They report what they did to telephony over an authenticated POST to
+`/ingest`, which is what fills the console's panes during a live call. `start.sh` generates
+`CONSOLE_INGEST_SECRET` and hands it to both processes; set it in `.env.local` only if you
+start the two by hand, and set the same value for both. Without it the tools stay quiet and
+the console shows the call and the gate but no lanes and no figures.
 
 Session checkpoints write to `data/sessions.json`, created on first checkpoint. Override the
 path with `SESSION_STORE_PATH` if you want it elsewhere, which is also how the tests keep

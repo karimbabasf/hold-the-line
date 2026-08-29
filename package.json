@@ -7,6 +7,8 @@
     "node": ">=22.6.0"
   },
   "scripts": {
+    "start": "./scripts/start.sh",
+    "stop": "./scripts/start.sh --stop",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --experimental-strip-types test/*.test.ts"
   },

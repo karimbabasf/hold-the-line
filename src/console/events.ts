@@ -54,6 +54,13 @@
  *                      call recomputed nothing.
  *   - `call`           bookends the stream.
  *
+ * There is a second wire in this file, `ReportFrame` and `ReportBatch`. The
+ * five event types that fill the console's panes are produced where the tools
+ * actually run, which is a different process (the MCP server on 8792) from
+ * the one holding the SSE clients (telephony, on 8791). A reported frame is
+ * the same event body with a wall-clock `at` in place of `t`, because only
+ * the telephony process knows when the call was answered.
+ *
  * `recordedNorthvaneCall()` below is not a mock: it is a literal transcript
  * of the call script in `docs/superpowers/specs/2026-08-28-northvane-scenario.md`
  * section 3, and every settlement figure in it was read off a real
@@ -124,15 +131,29 @@ export interface GateEvent {
   /** Stable id for one gate's lifecycle, opened through its resolution.
    *  Live, this is TrueForge's `tool_calls[].id` for the approval. */
   id: string;
-  /** The gated tool this approval is for, e.g. `"offer.state_settlement"`
-   *  or `"settlement.accept"`. Live, this is `arguments.tool_name` off the
-   *  `call_tool` envelope, never the envelope's own `name`, which is always
-   *  the literal string `"call_tool"`. Present on every status, not only
-   *  `'opened'`, so a client never has to remember it across a gap. */
+  /**
+   * The gated tool this approval is for, e.g. `"offer.state_settlement"`.
+   * Present on every status, not only `'opened'`, so a client never has to
+   * remember it across a gap.
+   *
+   * Live, this does NOT come off the approval event. Captured on
+   * 2026-08-29, that event carries only `id` and `source_event_id` per tool
+   * call: no `name`, no `arguments`. The tool name is `tool_name` inside the
+   * `call_tool` envelope on the `model.message` that `source_event_id`
+   * points at, and that envelope's `arguments` is a JSON string rather than
+   * an object. `resolveGate` in src/trueforge/types.ts does the unwrapping.
+   * The envelope's own `name` is always the literal `"call_tool"` and is
+   * never what belongs here.
+   */
   tool: string;
   status: 'opened' | 'sent_back' | 'approved';
-  /** The draft utterance. Present on `'opened'`. */
+  /** The draft utterance. Present on `'opened'`. Live, this is
+   *  `input.utterance` inside the same `call_tool` envelope as `tool`. */
   wanted?: string;
+  /** The claim the gate is on. Present on `'opened'` when the draft named
+   *  one, so an operator can post the final wording against the right
+   *  claim. */
+  claim_id?: string;
   /** What was actually spoken. Present on `'approved'`. */
   said?: string;
   /** The settlement breakdown beside the draft. Present on `'opened'`. */
@@ -181,6 +202,57 @@ export type ConsoleEvent =
   | HoldEvent
   | SessionEvent
   | CallEvent;
+
+/** `Omit` over a union has to be distributed by hand, or it collapses the
+ *  seven variants into one object with only their shared keys. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * One event minus its `t`.
+ *
+ * A process that is not the telephony process cannot fill `t` in: `t` is
+ * milliseconds since THIS call was answered, and only the process holding
+ * the call knows when that was. The MCP tool process therefore reports the
+ * event body plus a wall-clock `at`, and telephony converts. Nothing else
+ * would stay honest across a telephony restart, when the call clock is
+ * re-anchored and every queued frame has to be re-stamped against the new
+ * origin rather than keeping a `t` measured from an origin that is gone.
+ */
+export type ConsoleEventBody = DistributiveOmit<ConsoleEvent, 't'>;
+
+/** One reported event and the reporter's wall clock when it happened. */
+export interface ReportFrame {
+  /** `Date.now()` in the reporting process. Both processes are on one
+   *  machine, so this needs no clock-skew correction. */
+  at: number;
+  event: ConsoleEventBody;
+}
+
+/** What `POST /ingest` carries. A batch, not a single frame, so a reporter
+ *  that queued events while telephony was restarting delivers them in one
+ *  round trip rather than one per event. */
+export interface ReportBatch {
+  frames: ReportFrame[];
+}
+
+/** Runtime guard for an event body, by stamping the `t` it is missing and
+ *  reusing the one definition of valid above. */
+export function isConsoleEventBody(value: unknown): value is ConsoleEventBody {
+  if (typeof value !== 'object' || value === null) return false;
+  return isConsoleEvent({ ...(value as Record<string, unknown>), t: 0 });
+}
+
+/** Runtime guard for a decoded `POST /ingest` body. */
+export function isReportBatch(value: unknown): value is ReportBatch {
+  if (typeof value !== 'object' || value === null) return false;
+  const frames = (value as Record<string, unknown>)['frames'];
+  if (!Array.isArray(frames)) return false;
+  return frames.every((f: unknown) => {
+    if (typeof f !== 'object' || f === null) return false;
+    const frame = f as Record<string, unknown>;
+    return typeof frame['at'] === 'number' && isConsoleEventBody(frame['event']);
+  });
+}
 
 const STATUS_SETS: Record<string, ReadonlySet<string> | undefined> = {
   lane: new Set(['pending', 'done']),

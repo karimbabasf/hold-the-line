@@ -13,3 +13,6 @@ data/
 
 # agent worktrees, never part of the repo
 .claude/worktrees/
+
+# process logs from scripts/start.sh
+.run/

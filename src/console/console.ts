@@ -8,18 +8,22 @@
  * pull in just enough ambient browser typing for this one file to
  * typecheck under `npx tsc -p tsconfig.json --noEmit`.
  *
- * By default this replays `recordedNorthvaneCall()` from `events.ts` in
- * real time, so the console is demonstrable with no live call and no
- * server. Two query parameters change that for development:
+ * By default this connects live to `/events`, so the operator sees real
+ * call data the moment they open the page. Query parameters switch to the
+ * recorded demo or change playback for development:
  *
- *   ?speed=20        replay faster than real time (debugging, not demo).
- *   ?until=71000     dispatch every event with t <= 71000 instantly, then
- *                     freeze there. Used to capture docs/console.png with
- *                     the gate open and the hold clock already running.
- *   ?live=1          connect to a real emitter at /events instead of
- *                     replaying the fixture, once one exists.
+ *   ?demo             replay `recordedNorthvaneCall()` in real time.
+ *   ?speed=20         replay faster than real time (debugging, not demo).
+ *   ?until=71000      dispatch every event with t <= 71000 instantly, then
+ *                      freeze there. Used to capture docs/console.png with
+ *                      the gate open and the hold clock already running.
+ *   ?live=<url>       connect to a custom emitter URL instead of /events.
  *
- * None of the three change the event contract in `events.ts`; they only
+ * Live, the gate buttons post to `/gate/decide` on the telephony process,
+ * which is what actually releases a held caller. In replay they resolve the
+ * fixture locally, because there is no held caller to release.
+ *
+ * None of these change the event contract in `events.ts`; they only
  * change how this file schedules dispatch.
  */
 
@@ -39,6 +43,7 @@ import {
   type NumberEvent,
   type SessionEvent,
 } from './events.ts';
+import { createGateClient, type GateResult } from './gate-client.ts';
 import type { SettleLine } from '../settle/settle.ts';
 import {
   formatNumberLine,
@@ -149,6 +154,7 @@ let callEndedAtCallTime: number | null = null;
 function tickClocks(): void {
   el('call-clock').textContent = formatClock(callEndedAtCallTime ?? virtualNow());
   el('hold-clock').textContent = formatClock(currentHoldMs());
+  tickGateHold();
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +198,91 @@ function onNumber(ev: NumberEvent): void {
     h('span', { class: `computed-tag ${tagClass}` }, [tagText(ev)]),
   ]);
   el('computed-list').appendChild(tile);
+}
+
+
+// ---------------------------------------------------------------------------
+// Releasing a gate.
+//
+// Two transports, and the difference between them is whether there is a
+// caller on the line. Live, a click posts to `/gate/decide` and a real
+// person stops hearing silence; the outcome comes back on the SSE stream
+// like every other event, so every console watching sees it and one that
+// connects afterwards replays it. In fixture replay there is nothing to
+// release, so the click resolves the recording locally.
+//
+// Neither transport has a timer. Nothing here approves anything on its own.
+
+interface GateTransport {
+  /** True when a decision reaches a process holding a real caller. */
+  live: boolean;
+  approve(gate: GateState, said: string): Promise<GateResult>;
+  sendBack(gate: GateState, reason: string): Promise<GateResult>;
+}
+
+/** Where the operator token lives for this tab.
+ *
+ *  Not in the page. This listener is on a public tunnel, so anything served
+ *  from it is served to whoever finds the tunnel, and the token that decides
+ *  what a caller hears cannot travel that way. The operator pastes it once. */
+const TOKEN_KEY = 'hold-the-line.operator-token';
+
+function readToken(): string | null {
+  try {
+    return window.sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeToken(token: string): void {
+  try {
+    window.sessionStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    // A browser with site data blocked keeps the token in memory for this
+    // page load only, which is enough to work a call.
+    memoryToken = token;
+  }
+}
+
+let memoryToken: string | null = null;
+
+const liveTransport: GateTransport = {
+  live: true,
+  approve: (gate) => gateClient.approve(gate.id),
+  sendBack: (gate, reason) => gateClient.sendBack(gate.id, reason),
+};
+
+const gateClient = createGateClient({ token: () => readToken() ?? memoryToken });
+
+const replayTransport: GateTransport = {
+  live: false,
+  approve(gate, said) {
+    resolveGateLocally(gate, said);
+    return Promise.resolve({ ok: true });
+  },
+  sendBack(gate, reason) {
+    sendBackLocally(gate, reason);
+    return Promise.resolve({ ok: true });
+  },
+};
+
+let gateTransport: GateTransport = replayTransport;
+
+// ---------------------------------------------------------------------------
+// How long the caller has been held by THIS gate.
+//
+// The hold clock in the header counts every kind of dead air. This one counts
+// only the part an operator is causing by not deciding, which is the number
+// that should make them uncomfortable.
+
+let gateOpenedAtCallTime: number | null = null;
+let gateHeldEl: HTMLElement | null = null;
+
+function tickGateHold(): void {
+  if (!gateHeldEl || gateOpenedAtCallTime === null) return;
+  const heldMs = Math.max(0, virtualNow() - gateOpenedAtCallTime);
+  gateHeldEl.textContent = `The caller has been waiting ${formatClock(heldMs)} on this decision.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +372,10 @@ function renderGateOpen(gate: GateState): void {
   content.appendChild(
     h('div', { class: 'gate-halted' }, ['The line is halted. The caller cannot be spoken to again until this resolves.']),
   );
+  // Dead air an operator is causing by not deciding yet, counted separately
+  // from the call's own hold clock so it cannot hide inside it.
+  gateHeldEl = h('div', { class: 'gate-held mono' }, ['The caller has been waiting 0:00 on this decision.']);
+  content.appendChild(gateHeldEl);
   content.appendChild(h('div', { class: 'gate-meta mono' }, [`gate ${gate.id}  ·  ${gate.tool}`]));
 
   content.appendChild(h('label', { class: 'field-label' }, ['Draft utterance, editable']));
@@ -311,11 +406,62 @@ function renderGateOpen(gate: GateState): void {
     );
   }
 
+  content.appendChild(h('label', { class: 'field-label' }, ['Reason, if you are sending it back']));
+  const reasonBox = h('textarea', {
+    class: 'gate-reason-input',
+    rows: '2',
+    placeholder: 'the agent reads this and redrafts from it',
+  });
+  content.appendChild(reasonBox);
+
   const btnApprove = h('button', { class: 'btn btn--approve' }, ['Approve']);
   const btnApproveEdits = h('button', { class: 'btn btn--approve-edits is-inactive' }, ['Approve with edits']);
   btnApproveEdits.disabled = true;
   const btnSendBack = h('button', { class: 'btn btn--send-back' }, ['Send back to recompute']);
   content.appendChild(h('div', { class: 'gate-buttons' }, [btnApprove, btnApproveEdits, btnSendBack]));
+
+  const status = h('div', { class: 'gate-status mono' });
+  content.appendChild(status);
+
+  if (gateTransport.live && (readToken() ?? memoryToken) === null) {
+    renderTokenRow(content, () => {
+      say('token held for this tab. the buttons will reach the server now.');
+    });
+  }
+
+  function say(message: string, bad = false): void {
+    status.textContent = message;
+    status.classList.toggle('gate-status--bad', bad);
+  }
+
+  /**
+   * One decision, once.
+   *
+   * The buttons go dead the moment one is pressed and stay dead while the
+   * request is open, so a second click cannot send a second decision on a
+   * gate the server has already settled. They come back only if the decision
+   * failed, because a failed decision means the caller is still waiting.
+   */
+  let deciding = false;
+  async function decide(what: 'approve' | 'send back', run: () => Promise<GateResult>): Promise<void> {
+    if (deciding) return;
+    deciding = true;
+    const wasDisabled = [btnApprove.disabled, btnApproveEdits.disabled, btnSendBack.disabled];
+    btnApprove.disabled = true;
+    btnApproveEdits.disabled = true;
+    btnSendBack.disabled = true;
+    say(`sending the ${what}...`);
+    const result = await run();
+    if (result.ok) {
+      say(gateTransport.live ? `${what} sent. releasing the caller.` : `${what} recorded.`);
+      return;
+    }
+    deciding = false;
+    btnApprove.disabled = wasDisabled[0] ?? false;
+    btnApproveEdits.disabled = wasDisabled[1] ?? false;
+    btnSendBack.disabled = wasDisabled[2] ?? false;
+    say(result.error, true);
+  }
 
   const renderDiff = (): void => diff.replaceChildren(...renderWordDiff(gate.wanted, textarea.value));
   renderDiff();
@@ -348,17 +494,34 @@ function renderGateOpen(gate: GateState): void {
     btnSendBack.classList.toggle('is-emphasised', empty);
   });
 
-  // This is a replay of a recorded call, not a live backend, so these
-  // buttons resolve the gate locally rather than posting anywhere. If the
-  // operator acts before the fixture's own scripted resolution for this id
-  // would have fired, theirs wins and the later scripted one is dropped
-  // (see `gateResolutions` on `dispatch`); acting after it is a no-op, the
-  // id is already resolved. `?live=1` replaces this with a real POST to the
-  // emitter once one exists; the event shape it should send back is the
-  // same `GateEvent` this file already knows how to render.
-  btnApprove.addEventListener('click', () => resolveGateLocally(gate, textarea.value));
-  btnApproveEdits.addEventListener('click', () => resolveGateLocally(gate, textarea.value));
-  btnSendBack.addEventListener('click', () => sendBackLocally(gate));
+  // Live, an edited draft cannot be approved at all.
+  //
+  // The wire settles a gate on allow or deny and carries no wording, so an
+  // "approve with edits" would send the ORIGINAL sentence while the operator
+  // watched their own edit on screen and believed it had been authorised.
+  // That is a worse failure than the missing button. An edit goes back for a
+  // redraft instead, and the edited text is offered as the reason, which is
+  // exactly what the agent needs to write the next draft.
+  if (gateTransport.live) {
+    btnApproveEdits.title = 'editing a draft sends it back for a redraft on this wire';
+  }
+
+  btnApprove.addEventListener('click', () => {
+    void decide('approve', () => gateTransport.approve(gate, textarea.value));
+  });
+  btnApproveEdits.addEventListener('click', () => {
+    if (gateTransport.live) {
+      reasonBox.value = reasonBox.value.trim() === ''
+        ? `use this wording instead: ${textarea.value.trim()}`
+        : reasonBox.value;
+      say('edited drafts go back for a redraft. the wording is in the reason below.', true);
+      return;
+    }
+    void decide('approve', () => gateTransport.approve(gate, textarea.value));
+  });
+  btnSendBack.addEventListener('click', () => {
+    void decide('send back', () => gateTransport.sendBack(gate, reasonBox.value));
+  });
 }
 
 function renderGateApproved(ev: GateEvent): void {
@@ -374,6 +537,34 @@ function renderGateApproved(ev: GateEvent): void {
   ];
   if (ev.reason) rows.push(h('p', { class: 'gate-reason' }, [ev.reason]));
   content.replaceChildren(...rows);
+}
+
+/**
+ * Asks for the operator token, once per tab.
+ *
+ * Rendered in the gate pane rather than at page load, so a console that is
+ * only being watched never asks for a credential it does not need. Deciding
+ * a gate needs one; watching a call does not.
+ */
+function renderTokenRow(parent: HTMLElement, onStored: () => void): void {
+  const row = h('div', { class: 'gate-token' });
+  row.appendChild(h('label', { class: 'field-label' }, ['Operator token, to decide a gate']));
+  const input = h('input', {
+    class: 'gate-token-input mono',
+    type: 'password',
+    placeholder: 'TELEPHONY_SHARED_SECRET from .env.local',
+    autocomplete: 'off',
+  });
+  const save = h('button', { class: 'btn btn--approve-edits' }, ['Hold for this tab']);
+  save.addEventListener('click', () => {
+    const value = input.value.trim();
+    if (value === '') return;
+    writeToken(value);
+    input.value = '';
+    onStored();
+  });
+  row.appendChild(h('div', { class: 'gate-token-row' }, [input, save]));
+  parent.appendChild(row);
 }
 
 function renderGateAwaiting(message: string): void {
@@ -400,10 +591,10 @@ function resolveGateLocally(gate: GateState, said: string): void {
   dispatch({ type: 'gate', t: virtualNow(), id: gate.id, tool: gate.tool, status: 'approved', said });
 }
 
-function sendBackLocally(gate: GateState): void {
+function sendBackLocally(gate: GateState, reason: string): void {
   dispatch({
     type: 'gate', t: virtualNow(), id: gate.id, tool: gate.tool, status: 'sent_back',
-    reason: 'sent back to recompute (operator)',
+    reason: reason.trim() === '' ? 'sent back to recompute (operator)' : reason.trim(),
   });
 }
 
@@ -417,12 +608,16 @@ function onGate(ev: GateEvent): void {
       sources: ev.sources ?? [],
       authorisedAmounts: ev.authorised_amounts ?? [],
     };
+    gateOpenedAtCallTime = ev.t;
     renderGateOpen(currentGate);
+    tickGateHold();
     logGateHistory(ev.t, ev.id, 'opened');
     return;
   }
 
   if (ev.status === 'sent_back') {
+    gateOpenedAtCallTime = null;
+    gateHeldEl = null;
     renderGateAwaiting(ev.reason ? `Sent back to recompute. ${ev.reason}` : 'Sent back to recompute.');
     logGateHistory(ev.t, ev.id, 'sent back');
     if (currentGate?.id === ev.id) currentGate = null;
@@ -432,6 +627,8 @@ function onGate(ev: GateEvent): void {
   // 'approved'. gate-3 in the recording has no prior 'opened' at all: it
   // resolves straight from a pre-authorisation, which is the point of
   // scoping one.
+  gateOpenedAtCallTime = null;
+  gateHeldEl = null;
   renderGateApproved(ev);
   logGateHistory(ev.t, ev.id, ev.auto ? 'auto-approved' : 'approved');
   if (currentGate?.id === ev.id) currentGate = null;
@@ -609,16 +806,30 @@ function main(): void {
   setInterval(tickClocks, 250);
 
   const params = new URLSearchParams(window.location.search);
-  const live = params.get('live');
-  if (live) {
-    startLive(live === '1' ? '/events' : live);
+
+  // Demo replay requires an explicit ?demo param, or ?speed / ?until.
+  // Without any of those, the console connects live to /events so the
+  // operator sees real call data the moment they open the page.
+  const demo = params.has('demo');
+  const speedParam = params.get('speed');
+  const untilParam = params.get('until');
+
+  if (demo || speedParam !== null || untilParam !== null) {
+    const speed = Number(speedParam ?? '1') || 1;
+    const until = untilParam !== null && untilParam !== '' ? Number(untilParam) : null;
+    // A recording has no caller to release, so a click resolves it here.
+    gateTransport = replayTransport;
+    startReplay(recordedNorthvaneCall(), speed, until);
     return;
   }
 
-  const speed = Number(params.get('speed') ?? '1') || 1;
-  const untilParam = params.get('until');
-  const until = untilParam !== null && untilParam !== '' ? Number(untilParam) : null;
-  startReplay(recordedNorthvaneCall(), speed, until);
+  // Default: live mode. ?live=<url> overrides the endpoint.
+  const liveParam = params.get('live');
+  const liveUrl = liveParam && liveParam !== '1' ? liveParam : '/sse';
+  // A real caller is on the line, so a click has to reach the process holding
+  // them. The outcome comes back on this same stream.
+  gateTransport = liveTransport;
+  startLive(liveUrl);
 }
 
 // This file is imported under plain Node by test/loadable.test.ts, which
