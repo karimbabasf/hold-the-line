@@ -116,12 +116,21 @@ test('a leading zero in the cents is not read out', () => {
   assert.equal(speakNumbers('$8,764.05'), '8,764 dollars and 5 cents');
 });
 
-test('a fraction that is not cents is left exactly as it was', () => {
-  // Three decimals is not money. Rendering the first two as cents and leaving
-  // the third stranded would speak a different figure to the one on file, so
-  // an unexpected shape passes through untouched instead.
-  assert.equal(speakNumbers('$13,481.123'), '$13,481.123');
+test('a rate with more than two decimals is read digit by digit, not as cents', () => {
+  // mileage_adjustment_per_mile is 0.085 in fixtures/state_rules.json, so a
+  // three-decimal rate is a real figure this can be asked to say. Reading the
+  // first two digits as cents would strand the third and speak a different
+  // number. Found by Qodo on this PR.
+  assert.equal(speakNumbers('$0.085 a mile'), '0 point 0 8 5 dollars a mile');
+  assert.equal(speakNumbers('The rate is 0.085 a mile.'), 'The rate is 0 point 0 8 5 a mile.');
   assert.equal(speakNumbers('$1.5'), '1 dollar and 50 cents');
+});
+
+test('every digit of a long fraction survives in order', () => {
+  const said = speakNumbers('$13,481.1234');
+  assert.equal(said.replace(/[^0-9]/g, ''), '134811234');
+  assert.doesNotMatch(said, /\$/);
+  assert.doesNotMatch(said, /cents/);
 });
 
 test('a bare decimal is spoken as point, not as dot', () => {

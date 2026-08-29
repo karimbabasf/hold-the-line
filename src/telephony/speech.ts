@@ -73,6 +73,11 @@ function couldBecomeFiller(text: string): boolean {
  */
 const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
 
+/** "085" as "0 8 5", so a fraction is not read as the number eighty five. */
+function spelled(digits: string): string {
+  return digits.split('').join(' ');
+}
+
 /**
  * Rewrites figures into the words a TTS engine reads correctly.
  *
@@ -82,23 +87,30 @@ const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
  */
 export function speakNumbers(text: string): string {
   return text
-    .replace(CURRENCY, (match: string, whole: string, cents: string | undefined) => {
-      // Money has at most two decimals. Anything longer is not a figure this
-      // knows how to say, and reading the first two digits as cents would put
-      // a different amount in the caller's ear, so it passes through as it is.
-      if (cents !== undefined && cents.length > 2) return match;
-      const unit = whole.replace(/,/g, '') === '1' ? 'dollar' : 'dollars';
-      if (cents === undefined) return `${whole} ${unit}`;
+    .replace(CURRENCY, (_match, whole: string, fraction: string | undefined) => {
+      const oneDollar = whole.replace(/,/g, '') === '1';
+      // Longer than cents means a rate rather than an amount:
+      // mileage_adjustment_per_mile is 0.085. Reading the first two digits as
+      // cents would strand the third and speak a different figure, so a long
+      // fraction is read out digit by digit instead. Here the unit follows the
+      // whole value, not just the part before the point.
+      if (fraction !== undefined && fraction.length > 2) {
+        const exactlyOne = oneDollar && /^0*$/.test(fraction);
+        return `${whole} point ${spelled(fraction)} ${exactlyOne ? 'dollar' : 'dollars'}`;
+      }
       // "12" is twelve cents, ".5" is fifty. Padding right rather than parsing
       // the fraction keeps that the same either way.
-      const count = Number(cents.padEnd(2, '0'));
-      if (count === 0) return `${whole} ${unit}`;
-      return `${whole} ${unit} and ${count} ${count === 1 ? 'cent' : 'cents'}`;
+      const cents = fraction === undefined ? 0 : Number(fraction.padEnd(2, '0'));
+      const unit = oneDollar ? 'dollar' : 'dollars';
+      if (cents === 0) return `${whole} ${unit}`;
+      return `${whole} ${unit} and ${cents} ${cents === 1 ? 'cent' : 'cents'}`;
     })
-    // A decimal that still has a dollar sign in front of it is a money shape
-    // the rule above declined to touch, so this leaves it alone rather than
-    // half converting it.
-    .replace(/(?<!\$[\d,]*)(\d)\.(\d)/g, '$1 point $2');
+    // Same fraction rule for a bare decimal, and the dollar sign in the
+    // lookbehind keeps this off a money token the rule above already shaped or
+    // declined to shape.
+    .replace(/(?<!\$[\d,]*)(\d)\.(\d+)/g, (_m, before: string, fraction: string) =>
+      `${before} point ${fraction.length > 2 ? spelled(fraction) : fraction}`,
+    );
 }
 
 /**
