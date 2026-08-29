@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Direction A, call sheet</title>
+<style>
+  @font-face { font-family:'Geist Sans'; font-weight:400; font-display:block; src:url(/src/console/fonts/geist-sans-latin-400-normal.woff2) format('woff2'); }
+  @font-face { font-family:'Geist Sans'; font-weight:500; font-display:block; src:url(/src/console/fonts/geist-sans-latin-500-normal.woff2) format('woff2'); }
+  @font-face { font-family:'Geist Sans'; font-weight:700; font-display:block; src:url(/src/console/fonts/geist-sans-latin-700-normal.woff2) format('woff2'); }
+  @font-face { font-family:'Geist Mono'; font-weight:400; font-display:block; src:url(/src/console/fonts/geist-mono-latin-400-normal.woff2) format('woff2'); }
+  @font-face { font-family:'Geist Mono'; font-weight:500; font-display:block; src:url(/src/console/fonts/geist-mono-latin-500-normal.woff2) format('woff2'); }
+  @font-face { font-family:'Geist Mono'; font-weight:600; font-display:block; src:url(/src/console/fonts/geist-mono-latin-600-normal.woff2) format('woff2'); }
+
+  :root{
+    --ink:#0c0f16; --ink-2:#141924; --ink-3:#1b2130; --line:#242c3c;
+    --paper:#e8ecf4; --muted:#8a93a8; --faint:#5b6478;
+    --amber:#ffb020; --amber-dim:rgba(255,176,32,.13);
+    --settled:#7fd9a8;
+    --ease:cubic-bezier(.23,1,.32,1);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ink);color:var(--paper);
+    font-family:'Geist Sans',system-ui,sans-serif;font-size:15px;line-height:1.5;
+    font-optical-sizing:auto;}
+  .mono{font-family:'Geist Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+  .screen{min-height:100vh;display:flex;flex-direction:column;border-bottom:2px dashed #2a3345}
+  .caption{padding:8px 28px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);background:#080a0f}
+
+  /* the state rail: the top edge of the screen IS the state */
+  .rail{height:4px;background:var(--line)}
+  .rail--live{background:var(--paper);animation:breathe 3.2s ease-in-out infinite}
+  .rail--gate{background:var(--amber);animation:breathe 1.1s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:1}50%{opacity:.42}}
+
+  header{display:flex;align-items:center;gap:20px;padding:18px 28px 16px;border-bottom:1px solid var(--line)}
+  .who{display:flex;flex-direction:column;gap:2px}
+  .who-name{font-size:22px;font-weight:700;letter-spacing:-.015em}
+  .who-sub{font-size:13px;color:var(--muted)}
+  .hdr-spacer{flex:1}
+  .stat{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+  .stat-k{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
+  .stat-v{font-size:24px;font-weight:500;letter-spacing:-.01em}
+  .onair{display:inline-flex;align-items:center;gap:8px;font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--paper);font-weight:500}
+  .onair::before{content:'';width:9px;height:9px;border-radius:99px;background:var(--paper);animation:breathe 2s ease-in-out infinite}
+
+  main{flex:1;display:grid;grid-template-columns:270px minmax(0,1fr) 400px;gap:0}
+  .col{padding:22px 24px;min-width:0}
+  .col + .col{border-left:1px solid var(--line)}
+  .col-h{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:0 0 14px}
+
+  /* left: what the agent is doing, in plain words */
+  .doing-now{font-size:19px;font-weight:500;line-height:1.3;letter-spacing:-.01em;margin-bottom:18px}
+  .steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px}
+  .step{display:grid;grid-template-columns:14px 1fr;gap:10px;align-items:baseline;font-size:13.5px;color:var(--faint)}
+  .step b{font-weight:400;color:var(--faint)}
+  .step--done{color:var(--muted)}
+  .step--done .tick{color:var(--settled)}
+  .step--now{color:var(--paper)}
+  .step-time{display:block;font-size:11.5px;color:var(--faint)}
+  .together{margin-top:20px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
+    background:var(--ink-2);font-size:13px;color:var(--muted);line-height:1.45}
+  .together b{color:var(--paper);font-weight:500}
+
+  /* centre: transcript */
+  .tr{display:flex;flex-direction:column;gap:14px}
+  .line{max-width:82%;display:flex;flex-direction:column;gap:5px}
+  .line--caller{align-self:flex-start}
+  .line--agent{align-self:flex-end;align-items:flex-end}
+  .spk{font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+  .bub{padding:11px 15px;border-radius:14px;font-size:17px;line-height:1.45;letter-spacing:-.005em}
+  .line--caller .bub{background:var(--ink-2);border:1px solid var(--line);border-bottom-left-radius:4px}
+  .line--agent .bub{background:var(--ink-3);border:1px solid #2c3446;border-bottom-right-radius:4px}
+  .bub--partial{color:var(--muted)}
+  .bub--partial::after{content:'';display:inline-block;width:2px;height:15px;background:var(--muted);
+    margin-left:3px;vertical-align:-2px;animation:blink 1s steps(2,start) infinite}
+  @keyframes blink{to{visibility:hidden}}
+
+  /* right: the money */
+  .fig{font-size:46px;font-weight:700;letter-spacing:-.035em;line-height:1}
+  .fig-k{font-size:12px;color:var(--muted);margin-top:6px}
+  .stmt{list-style:none;margin:20px 0 0;padding:0}
+  .row{display:grid;grid-template-columns:1fr auto;gap:14px;padding:6px 0;font-size:13.5px;border-bottom:1px solid #1a202c}
+  .row span:first-child{color:var(--muted)}
+  .row--total{border-bottom:none;border-top:1.5px solid var(--line);margin-top:6px;padding-top:10px;font-size:16px;font-weight:500}
+  .row--total span:first-child{color:var(--paper)}
+  .prov{margin-top:14px;font-size:12px;color:var(--faint)}
+
+  footer{display:flex;gap:26px;align-items:center;padding:13px 28px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--muted);background:#0a0d13}
+  .harness{margin-left:auto;display:inline-flex;align-items:center;gap:7px;color:var(--faint);font-size:12px}
+  .harness::before{content:'';width:6px;height:6px;border-radius:99px;background:var(--settled)}
+
+  /* gate takeover */
+  .gate-wrap{position:relative}
+  .dim{opacity:.28;filter:saturate(.4)}
+  .gate{position:absolute;inset:24px;background:var(--ink-2);border:1px solid var(--amber);
+    border-radius:18px;padding:26px 30px;box-shadow:0 30px 80px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:16px}
+  .gate-eyebrow{display:flex;align-items:center;gap:10px;font-size:11.5px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--amber);font-weight:500}
+  .gate-eyebrow::before{content:'';width:9px;height:9px;border-radius:99px;background:var(--amber);animation:breathe 1.1s ease-in-out infinite}
+  .gate-h{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0}
+  .gate-sub{margin:-8px 0 0;color:var(--muted);font-size:14px}
+  .say{background:var(--ink);border:1px solid var(--line);border-left:3px solid var(--amber);
+    border-radius:12px;padding:18px 22px;font-size:21px;line-height:1.5;letter-spacing:-.012em}
+  .gate-cols{display:grid;grid-template-columns:1fr 300px;gap:26px;align-items:start}
+  .btns{display:flex;gap:10px;align-items:center}
+  .btn{padding:12px 22px;border-radius:10px;border:1px solid var(--line);background:var(--ink-3);
+    color:var(--paper);font:inherit;font-weight:500;font-size:15px;cursor:pointer}
+  .btn--go{background:var(--amber);border-color:var(--amber);color:#241701;font-weight:700}
+  .waiting{margin-left:auto;color:var(--amber);font-size:13px}
+</style>
+</head>
+<body>
+
+<!-- ============ MID-CALL ============ -->
+<section class="screen">
+  <div class="rail rail--live"></div>
+  <header>
+    <div class="who">
+      <div class="who-name">Daniel Ortiz</div>
+      <div class="who-sub">Claim 40218 &middot; 2021 Subaru Outback</div>
+    </div>
+    <div class="hdr-spacer"></div>
+    <div class="stat"><span class="stat-k">On the call</span><span class="stat-v mono">0:45</span></div>
+    <div class="stat"><span class="onair">On air</span></div>
+  </header>
+
+  <main>
+    <div class="col">
+      <h2 class="col-h">What the agent is doing</h2>
+      <div class="doing-now">Working out the settlement</div>
+      <ul class="steps">
+        <li class="step step--done"><span class="tick">&#10003;</span><span>Reading the policy<span class="step-time">1.1 s</span></span></li>
+        <li class="step step--done"><span class="tick">&#10003;</span><span>Pricing the car against recent sales<span class="step-time">1.6 s</span></span></li>
+        <li class="step step--done"><span class="tick">&#10003;</span><span>Getting the loan payoff<span class="step-time">2.2 s</span></span></li>
+        <li class="step step--done"><span class="tick">&#10003;</span><span>Checking past claims on this car<span class="step-time">2.8 s</span></span></li>
+        <li class="step step--done"><span class="tick">&#10003;</span><span>Checking the state's rules<span class="step-time">3.4 s</span></span></li>
+      </ul>
+      <div class="together">All five checks ran at the same time. <b>3.4 s</b> instead of <b>11.1 s</b> one after another.</div>
+    </div>
+
+    <div class="col">
+      <h2 class="col-h">The call</h2>
+      <div class="tr">
+        <div class="line line--caller"><span class="spk">Caller</span><div class="bub">Claim 40218, the Outback. Shop says it's totaled and the yard is charging me by the day. What am I getting?</div></div>
+        <div class="line line--agent"><span class="spk">Agent</span><div class="bub">I have the claim, and I have an adjuster on this call with me. Give me a moment, I am pulling everything at once.</div></div>
+        <div class="line line--agent"><span class="spk">Agent</span><div class="bub">Your car was worth 21,340 dollars. Repairs came to 16,780, which is 78.6 percent of that, and our threshold in this state is 75. So yes, it is a total loss.</div></div>
+        <div class="line line--caller"><span class="spk">Caller</span><div class="bub">Hold on. My statement said 8,700. Where's 8,764 coming from?</div></div>
+        <div class="line line--agent"><span class="spk">Agent</span><div class="bub bub--partial">Your loan accrues 1 dollar 84 cents a day. I quoted the payoff through October 2, which is</div></div>
+      </div>
+    </div>
+
+    <div class="col">
+      <h2 class="col-h">The offer</h2>
+      <div class="fig mono">$13,481.12</div>
+      <div class="fig-k">Net settlement, cash</div>
+      <ul class="stmt">
+        <li class="row"><span>Market value of the car</span><span class="mono">$21,485.00</span></li>
+        <li class="row"><span>Prior damage</span><span class="mono">&minus;$640.00</span></li>
+        <li class="row"><span>Factory options</span><span class="mono">$495.00</span></li>
+        <li class="row"><span>Sales tax at 8.6%</span><span class="mono">$1,835.24</span></li>
+        <li class="row"><span>Title and registration</span><span class="mono">$70.00</span></li>
+        <li class="row"><span>Collision deductible</span><span class="mono">&minus;$1,000.00</span></li>
+        <li class="row"><span>Loan payoff to Cascade</span><span class="mono">&minus;$8,764.12</span></li>
+        <li class="row row--total"><span>What we pay</span><span class="mono">$13,481.12</span></li>
+      </ul>
+      <div class="prov">Every line is either on file or calculated. <u>Show where each came from</u></div>
+    </div>
+  </main>
+
+  <footer>
+    <span>14 numbers said, every one traced to a source.</span>
+    <span>2 binding sentences, both approved by a person.</span>
+    <span class="harness">TrueForge harness connected &middot; northvane-claims</span>
+  </footer>
+  <div class="caption">Direction A &mdash; call sheet &mdash; mid-call</div>
+</section>
+
+<!-- ============ GATE ============ -->
+<section class="screen">
+  <div class="rail rail--gate"></div>
+  <header>
+    <div class="who">
+      <div class="who-name">Daniel Ortiz</div>
+      <div class="who-sub">Claim 40218 &middot; 2021 Subaru Outback</div>
+    </div>
+    <div class="hdr-spacer"></div>
+    <div class="stat"><span class="stat-k">On the call</span><span class="stat-v mono">1:14</span></div>
+    <div class="stat"><span class="stat-k" style="color:var(--amber)">Line halted</span><span class="stat-v mono" style="color:var(--amber)">0:04</span></div>
+  </header>
+
+  <div class="gate-wrap" style="flex:1;display:flex">
+    <main class="dim" style="flex:1">
+      <div class="col"><h2 class="col-h">What the agent is doing</h2><div class="doing-now">Waiting for your approval</div></div>
+      <div class="col"><h2 class="col-h">The call</h2></div>
+      <div class="col"><h2 class="col-h">The offer</h2><div class="fig mono">$13,481.12</div></div>
+    </main>
+    <div class="gate">
+      <div class="gate-eyebrow">Needs you now</div>
+      <h2 class="gate-h">The agent wants to make a binding offer</h2>
+      <p class="gate-sub">Nothing is said to the caller until you decide. The line is silent right now.</p>
+      <div class="say">&ldquo;Northvane can settle your claim today at 13,481 dollars and 12 cents, final, and that closes claim 40218.&rdquo;</div>
+      <div class="gate-cols">
+        <ul class="stmt" style="margin:0">
+          <li class="row"><span>Market value of the car</span><span class="mono">$21,485.00</span></li>
+          <li class="row"><span>Prior damage</span><span class="mono">&minus;$640.00</span></li>
+          <li class="row"><span>Factory options</span><span class="mono">$495.00</span></li>
+          <li class="row"><span>Sales tax at 8.6%</span><span class="mono">$1,835.24</span></li>
+          <li class="row"><span>Title and registration</span><span class="mono">$70.00</span></li>
+          <li class="row"><span>Collision deductible</span><span class="mono">&minus;$1,000.00</span></li>
+          <li class="row"><span>Loan payoff to Cascade</span><span class="mono">&minus;$8,764.12</span></li>
+          <li class="row row--total"><span>What we pay</span><span class="mono">$13,481.12</span></li>
+        </ul>
+        <div>
+          <div class="col-h">If you send it back</div>
+          <div style="border:1px solid var(--line);border-radius:10px;padding:11px 13px;color:var(--faint);background:var(--ink);font-size:13.5px;min-height:76px">Tell the agent what to change. It redrafts from this.</div>
+        </div>
+      </div>
+      <div class="btns">
+        <button class="btn btn--go">Approve and say it</button>
+        <button class="btn">Send back</button>
+        <span class="waiting mono">The caller has been waiting 0:04 on this.</span>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span>14 numbers said, every one traced to a source.</span>
+    <span class="harness">TrueForge harness connected &middot; northvane-claims</span>
+  </footer>
+  <div class="caption">Direction A &mdash; call sheet &mdash; approval waiting</div>
+</section>
+
+</body>
+</html>
