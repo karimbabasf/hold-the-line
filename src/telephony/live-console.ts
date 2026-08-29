@@ -98,42 +98,144 @@ function tokenMatches(header: string | undefined, secret: string): boolean {
 }
 
 /**
- * What one Telnyx TeXML status callback means for the screen.
+ * One event name, with `.`, `-` and `_` all read as the same character.
  *
- * The callback is form encoded and mirrors Twilio's: `CallStatus`, `From`,
- * `To`, `CallSid`. It is the only signal on this integration that arrives
- * when the phone is answered rather than when the caller has finished a
- * sentence, and the only one that arrives at all when a caller hangs up
- * during silence. Both are what an operator watches the header for.
+ * Telnyx spells one moment of a call several ways depending on which surface
+ * emitted it, and this account has already delivered two of them to the same
+ * endpoint on the same call: `completed` from the TeXML status callback and
+ * `conversation_ended` from the assistant. Matching a normalised name is what
+ * stops the next spelling from silently becoming an ignore.
+ */
+const normalise = (name: string): string => name.trim().toLowerCase().replace(/[.\-\s]/g, '_');
+
+/**
+ * Names that mean a caller is on the line.
  *
- * Statuses are matched by name and anything unrecognised is ignored rather
- * than guessed at: a status this does not know is not evidence a call
+ * `assistant_initialization` is the one that matters. It is the ONLY start
+ * side signal Telnyx offers on this integration: the TeXML application has no
+ * event list to subscribe to, so its status callback reports the end of a
+ * call and never the beginning. See `pointConversationStart` in
+ * `scripts/telnyx-assistant.mts` for what was tried and what each attempt
+ * returned.
+ *
+ * `ringing` is deliberately absent. An inbound leg is ringing before anyone
+ * has answered it, and a header that says ON CALL for a phone that is still
+ * ringing is the same lie in the other direction.
+ */
+const STARTED_EVENTS = new Set([
+  // TeXML status callback, form encoded. Never observed on this account, kept
+  // because it costs nothing and is what the callback is documented to send.
+  'in_progress',
+  'answered',
+  // The assistant's dynamic-variables webhook, JSON. Telnyx posts this to
+  // resolve `{{variables}}` BEFORE it speaks the greeting, which makes it
+  // earlier than an `answered` would have been.
+  'assistant_initialization',
+  // Not seen here, accepted anyway: the cost of being wrong about these is a
+  // dead screen, and the cost of accepting them is nothing.
+  'call_answered',
+  'conversation_started',
+]);
+
+/** Names that mean the line is dead. A call ends once; `broadcast` drops the
+ *  repeat, so a call that reports two of these is not ended twice. */
+const ENDED_EVENTS = new Set([
+  'completed',
+  'busy',
+  'failed',
+  'no_answer',
+  'canceled',
+  'cancelled',
+  // Delivered right behind `completed` on the real call of 2026-08-29. It
+  // only decides anything on a call where it arrives without one.
+  'conversation_ended',
+  'call_hangup',
+  'call_completed',
+]);
+
+/**
+ * The event name and the caller out of a JSON webhook body, or null when the
+ * body is not JSON at all.
+ *
+ * Telnyx wraps its webhooks in `data` and puts everything worth reading in
+ * `data.payload`. Both wrappers are optional here because being tolerant of a
+ * flatter shape costs one `??` and saves a dead screen.
+ */
+function readJsonEvent(body: string): { event: string; caller?: string } | null {
+  if (!body.trimStart().startsWith('{')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+
+  const root = parsed as Record<string, unknown>;
+  const nested = (key: string, of: Record<string, unknown>): Record<string, unknown> =>
+    typeof of[key] === 'object' && of[key] !== null ? (of[key] as Record<string, unknown>) : {};
+  const data = typeof root['data'] === 'object' && root['data'] !== null
+    ? (root['data'] as Record<string, unknown>)
+    : root;
+  const payload = nested('payload', data);
+
+  const event = data['event_type'] ?? root['event_type'];
+  // `telnyx_end_user_target` is the other end of the call, which on an
+  // inbound-only line is the caller. The rest are what the same field is
+  // called on Telnyx's other webhook shapes.
+  const from =
+    payload['telnyx_end_user_target'] ?? payload['from'] ?? payload['From'] ?? data['from'];
+
+  return {
+    event: typeof event === 'string' ? event : '',
+    ...(typeof from === 'string' && from !== '' ? { caller: from } : {}),
+  };
+}
+
+/**
+ * What one Telnyx webhook means for the screen.
+ *
+ * Two shapes arrive on this one route and both are handled here rather than
+ * split across two endpoints, because they are the same question asked twice:
+ *
+ *   - The TeXML status callback, form encoded and mirroring Twilio's:
+ *     `CallStatus`, `From`, `To`, `CallSid`. This is the hangup half. It is
+ *     the only thing that arrives at all when a caller hangs up in silence.
+ *   - The assistant's dynamic-variables webhook, JSON, shaped
+ *     `{"data": {"event_type": "assistant.initialization", "payload": {...}}}`.
+ *     This is the wake-up half, and it lands before the greeting is spoken.
+ *
+ * Names are matched after normalising, and anything unrecognised is ignored
+ * rather than guessed at: a name this does not know is not evidence a call
  * started, and certainly not evidence one ended.
  */
 export function readTelnyxStatus(body: string): {
   kind: 'started' | 'ended' | 'ignore';
   status: string;
   caller?: string;
+  /** True for the one body on this route that Telnyx reads an answer to. It
+   *  is waiting on dynamic variables before it speaks, so it gets the shape
+   *  it asked for rather than this endpoint's usual `{ok: true}`. */
+  wantsVariables?: boolean;
 } {
-  const form = new URLSearchParams(body);
-  const status = (form.get('CallStatus') ?? '').toLowerCase();
-  const from = form.get('From') ?? undefined;
+  const json = readJsonEvent(body);
+  const form = json === null ? new URLSearchParams(body) : null;
+  const raw = form === null ? (json?.event ?? '') : (form.get('CallStatus') ?? '');
+  const from = form === null ? json?.caller : (form.get('From') ?? undefined);
+
+  const status = raw.toLowerCase();
+  const name = normalise(status);
   const caller = from === undefined || from === '' ? {} : { caller: from };
 
-  // `ringing` is deliberately not a start. An inbound leg is ringing before
-  // anyone has answered it, and a header that says ON CALL for a phone that
-  // is still ringing is the same lie in the other direction.
-  if (status === 'in-progress' || status === 'answered') {
-    return { kind: 'started', status, ...caller };
+  if (STARTED_EVENTS.has(name)) {
+    return {
+      kind: 'started',
+      status,
+      ...caller,
+      ...(name === 'assistant_initialization' ? { wantsVariables: true } : {}),
+    };
   }
-  if (
-    status === 'completed' ||
-    status === 'busy' ||
-    status === 'failed' ||
-    status === 'no-answer' ||
-    status === 'canceled' ||
-    status === 'cancelled'
-  ) {
+  if (ENDED_EVENTS.has(name)) {
     return { kind: 'ended', status, ...caller };
   }
   return { kind: 'ignore', status, ...caller };

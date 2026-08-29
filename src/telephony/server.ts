@@ -443,6 +443,15 @@ const handle = createRouter({
       // next caller's call the moment it opened.
       if (live.onCall()) live.callEnded();
     }
+    // The dynamic-variables webhook is the one caller on this route that
+    // reads our answer, and it is holding the greeting until it arrives. It
+    // gets the shape it asked for. This assistant templates no `{{variables}}`
+    // so the object is empty, but an empty one is answered rather than a
+    // wrong one: Telnyx logs a mismatched body as a webhook error, which is
+    // noise on the one surface anybody would look at to debug a dead screen.
+    if (ev.wantsVariables) {
+      return { status: 200, body: { dynamic_variables: {} } };
+    }
     return { status: 200, body: { ok: true } };
   },
 });

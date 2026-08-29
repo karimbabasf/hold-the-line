@@ -142,3 +142,125 @@ test('an end with no call showing is not held against the next call', () => {
     'the new call was ended by a stale hangup',
   );
 });
+
+/**
+ * The wake-up half, which is a different body on the same route.
+ *
+ * The TeXML status callback never delivers a start: on the real call of
+ * 2026-08-29 it sent `completed`, `conversation_ended` and `analyzed` and
+ * nothing else, and its application object has no event list to subscribe
+ * to. What does arrive at the start is the assistant's dynamic-variables
+ * webhook, POSTed as JSON before the greeting is spoken. These pin the shape
+ * Telnyx documents for it, field for field.
+ */
+const initialization = (payload: Record<string, unknown> = {}) =>
+  JSON.stringify({
+    data: {
+      record_type: 'event',
+      id: 'event_12345678-90ab-cdef-1234-567890abcdef',
+      event_type: 'assistant.initialization',
+      occurred_at: '2026-08-29T10:00:00Z',
+      payload: {
+        telnyx_conversation_channel: 'phone_call',
+        telnyx_agent_target: '+14157238926',
+        telnyx_end_user_target: '+14155550101',
+        telnyx_end_user_target_verified: false,
+        call_control_id: 'v3:u5OAKGEPT3Dx8SZSSDRWEMdNH2OripQhO',
+        assistant_id: 'assistant-c7746f9b',
+        ...payload,
+      },
+    },
+  });
+
+test('the dynamic-variables webhook is the start of a call', () => {
+  const ev = readTelnyxStatus(initialization());
+
+  assert.equal(ev.kind, 'started');
+  assert.equal(ev.status, 'assistant.initialization');
+  // `telnyx_end_user_target` is the other end of the line, which on an
+  // inbound-only number is the caller. It is what the header shows.
+  assert.equal(ev.caller, '+14155550101');
+  // Telnyx is holding the greeting until this one answers, and it wants
+  // dynamic variables back rather than this endpoint's usual {ok: true}.
+  assert.equal(ev.wantsVariables, true);
+});
+
+test('a start with no caller number still opens the call', () => {
+  // A web call has no phone number on either end.
+  const body = JSON.stringify({
+    data: { event_type: 'assistant.initialization', payload: { telnyx_conversation_channel: 'web_call' } },
+  });
+  assert.deepEqual(readTelnyxStatus(body), { kind: 'started', status: 'assistant.initialization', wantsVariables: true });
+});
+
+test('start-side names Telnyx has not sent here are still read as a start', () => {
+  // Accepted because the cost of being wrong about them is a dead screen.
+  for (const event of ['call.answered', 'conversation.started', 'conversation_started']) {
+    const ev = readTelnyxStatus(JSON.stringify({ data: { event_type: event } }));
+    assert.equal(ev.kind, 'started', `${event} should start a call`);
+    // Only the initialization webhook is waiting on a variables body.
+    assert.equal(ev.wantsVariables, undefined, `${event} should not want variables`);
+  }
+});
+
+test('the end of a call is read from every shape that has carried one', () => {
+  // Both spellings the account actually delivered, on both wire formats.
+  assert.equal(readTelnyxStatus('CallStatus=conversation_ended').kind, 'ended');
+  assert.equal(readTelnyxStatus(JSON.stringify({ data: { event_type: 'conversation.ended' } })).kind, 'ended');
+  assert.equal(readTelnyxStatus(JSON.stringify({ data: { event_type: 'call.hangup' } })).kind, 'ended');
+  assert.equal(readTelnyxStatus(JSON.stringify({ event_type: 'completed' })).kind, 'ended');
+  // A hangup carries the caller through, whichever shape it arrived in.
+  const withFrom = JSON.stringify({ data: { event_type: 'call.hangup', payload: { from: '+14155550101' } } });
+  assert.equal(readTelnyxStatus(withFrom).caller, '+14155550101');
+});
+
+test('post-call analysis is not a hangup and is not a start', () => {
+  // `analyzed` lands after the caller has already gone. Ending the call on it
+  // would end whatever call is on screen by then, which is the next one.
+  assert.equal(readTelnyxStatus('CallStatus=analyzed').kind, 'ignore');
+  assert.equal(readTelnyxStatus(JSON.stringify({ data: { event_type: 'conversation.analyzed' } })).kind, 'ignore');
+  // A name nobody recognises is not evidence of anything, in either format.
+  assert.equal(readTelnyxStatus(JSON.stringify({ data: { event_type: 'assistant.tool_called' } })).kind, 'ignore');
+  assert.equal(readTelnyxStatus(JSON.stringify({ data: {} })).kind, 'ignore');
+});
+
+test('a body that is neither shape is ignored rather than thrown on', () => {
+  // Telnyx is on the other end of this and a parse error would 500 at it.
+  assert.equal(readTelnyxStatus('{not json at all').kind, 'ignore');
+  assert.equal(readTelnyxStatus('{}').kind, 'ignore');
+  assert.equal(readTelnyxStatus('null').kind, 'ignore');
+  assert.equal(readTelnyxStatus('[]').kind, 'ignore');
+});
+
+test('the form-encoded callback is untouched by the JSON path', () => {
+  // The hangup half still parses exactly as it did, `wantsVariables` and all:
+  // only the dynamic-variables webhook is owed a variables body.
+  assert.deepEqual(readTelnyxStatus('CallStatus=completed&CallDuration=61'), {
+    kind: 'ended',
+    status: 'completed',
+  });
+});
+
+test('the webhook lights the console up before anyone has said anything', () => {
+  const live = createLiveConsole();
+  const seen = watch(live);
+
+  // What server.ts does with a `started`: no id, because Telnyx's own
+  // conversation id is not what the turns are keyed on.
+  const ev = readTelnyxStatus(initialization());
+  assert.equal(ev.kind, 'started');
+  live.callStarted(undefined, ev.caller);
+
+  assert.equal(live.onCall(), true);
+  const events = seen.events();
+  assert.equal(events[0]?.['type'], 'call');
+  assert.equal(events[0]?.['status'], 'started');
+  assert.equal(events[0]?.['caller'], '+14155550101');
+
+  // And the first turn, which arrives after the greeting, adopts it rather
+  // than opening a second call.
+  live.callStarted('telnyx-conversation-abc', 'telnyx-conversation-abc');
+  live.callerSaid('My claim number is CLM-40218.', 'telnyx-conversation-abc');
+  assert.equal(seen.events().filter((e) => e['type'] === 'call' && e['status'] === 'started').length, 1);
+  assert.equal(seen.events().filter((e) => e['type'] === 'transcript').length, 1);
+});
