@@ -1,0 +1,16 @@
+{
+  "policy_id": "NVM-4417-2288",
+  "holder_name": "Daniel Ortiz",
+  "phone": "+14155550142",
+  "state": "AZ",
+  "coverages": [
+    "collision",
+    "comp",
+    "rental"
+  ],
+  "deductible_collision": 1000.0,
+  "rental_days_allowed": 30,
+  "rental_days_used": 26,
+  "effective_from": "2026-03-01",
+  "effective_to": "2027-03-01"
+}

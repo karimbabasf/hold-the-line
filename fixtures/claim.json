@@ -1,0 +1,14 @@
+{
+  "claim_id": "CLM-40218",
+  "policy_id": "NVM-4417-2288",
+  "vin": "4S4BTAFC7M3201884",
+  "loss_date": "2026-08-21",
+  "quote_date": "2026-08-28",
+  "repair_estimate": 16780.0,
+  "shop_name": "Bayview Collision",
+  "yard_id": "YRD-118",
+  "storage_per_day": 75.0,
+  "storage_start": "2026-08-22",
+  "status": "pending_total_loss_review",
+  "adjuster": "operator on duty"
+}

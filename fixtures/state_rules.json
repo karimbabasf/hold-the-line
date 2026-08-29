@@ -1,0 +1,13 @@
+{
+  "state": "AZ",
+  "total_loss_threshold_pct": 75.0,
+  "sales_tax_pct": 8.6,
+  "title_fee": 15.0,
+  "reg_fee": 55.0,
+  "tax_reimbursed_on_total_loss": true,
+  "offer_validity_days": 30,
+  "salvage_retention_allowed": true,
+  "lien_consent_required": true,
+  "mileage_adjustment_per_mile": 0.085,
+  "note": "Fixture values for a fictional insurer in a demo. Not a statement of Arizona law."
+}
