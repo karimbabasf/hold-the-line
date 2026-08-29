@@ -90,3 +90,54 @@ test('a request that never responds still times out', async () => {
   });
   await assert.rejects(() => client.createSession('northvane'), /abort/i);
 });
+
+test('a stalled JSON body still hits the deadline', async () => {
+  // Clearing the timeout at headers protects SSE streams but left finite
+  // reads with no deadline at all, so a server that sends headers and then
+  // stalls hung createSession forever. Qodo caught this on the follow-up
+  // review of the original timeout fix.
+  const client = new TrueForgeClient({
+    requestTimeoutMs: 40,
+    fetchImpl: async (_url, init) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"data":'));
+            // Never closes. The abort has to be what ends this.
+            init?.signal?.addEventListener('abort', () => {
+              controller.error(new Error('aborted'));
+            });
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+  });
+
+  await assert.rejects(() => client.createSession('northvane'), /abort|error/i);
+});
+
+test('a streaming turn is still not killed by that deadline', async () => {
+  // The fix above must not undo the original one.
+  const client = new TrueForgeClient({
+    requestTimeoutMs: 30,
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const enc = new TextEncoder();
+            controller.enqueue(enc.encode('data: {"type":"a"}\n\n'));
+            await new Promise((r) => setTimeout(r, 120));
+            controller.enqueue(enc.encode('data: {"type":"b"}\n\n'));
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+
+  const seen: string[] = [];
+  for await (const e of client.streamTurn('s', [{ type: 'user.message', content: 'hi' }])) {
+    seen.push(e.type);
+  }
+  assert.deepEqual(seen, ['a', 'b']);
+});

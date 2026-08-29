@@ -87,7 +87,7 @@ export class TrueForgeClient {
   ): AsyncGenerator<TurnEvent> {
     assertHomogeneousInput(input);
 
-    const res = await this.request(
+    const res = await this.stream(
       'POST',
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
       { input, stream: true },
@@ -134,60 +134,98 @@ export class TrueForgeClient {
     );
   }
 
-  private async json<T>(
-    method: string,
-    path: string,
-    body?: unknown,
-  ): Promise<T> {
-    const res = await this.request(method, path, body);
-    return (await res.json()) as T;
+  /**
+   * Sends a request whose body is finite, and reads it under the deadline.
+   *
+   * The body is consumed here rather than handed back, so the timer can stay
+   * live across the read without cloning the response to observe it.
+   */
+  private async json<T>(method: string, path: string, body?: unknown): Promise<T> {
+    return this.send(method, path, body, undefined, async (res, timer) => {
+      try {
+        return (await res.json()) as T;
+      } finally {
+        clearTimeout(timer);
+      }
+    });
   }
 
-  private async request(
+  /**
+   * Sends a request whose body is a long-lived stream.
+   *
+   * The timer is cleared once headers arrive, because the whole point is that
+   * an SSE turn may legitimately outlive it. From there the caller's own
+   * signal governs the body.
+   */
+  private async stream(
     method: string,
     path: string,
     body?: unknown,
     signal?: AbortSignal,
   ): Promise<Response> {
-    // The timeout covers CONNECTING only, and is cleared the moment headers
-    // arrive.
-    //
-    // AbortSignal.timeout() stays live for the whole response lifetime,
-    // including the body. On an SSE turn that means the harness gets 30
-    // seconds total and then the stream dies mid-call, which is precisely the
-    // failure this project cannot have: a caller on hold while the agent is
-    // thinking. The caller's own signal stays attached, because a caller who
-    // hangs up should still cancel the turn.
-    const connectTimeout = new AbortController();
+    return this.send(method, path, body, signal, (res, timer) => {
+      clearTimeout(timer);
+      return Promise.resolve(res);
+    });
+  }
+
+  /**
+   * The shared request path.
+   *
+   * Two things must both hold and they pull in opposite directions. A 30
+   * second timeout attached to the whole response lifetime kills an SSE turn
+   * mid-call, which is the failure this project cannot have: a caller on hold
+   * while the agent is thinking. But clearing it at headers for every request
+   * leaves a finite read with no deadline, so a server that sends headers and
+   * stalls its body hangs forever. Both were live bugs, both caught by review.
+   *
+   * So the caller decides when the timer dies, via `settle`.
+   */
+  private async send<T>(
+    method: string,
+    path: string,
+    body: unknown,
+    signal: AbortSignal | undefined,
+    settle: (res: Response, timer: ReturnType<typeof setTimeout>) => Promise<T>,
+  ): Promise<T> {
+    const deadline = new AbortController();
     const timer = setTimeout(() => {
-      connectTimeout.abort(new Error(`no response within ${this.timeoutMs}ms`));
+      deadline.abort(new Error(`no response within ${this.timeoutMs}ms`));
     }, this.timeoutMs);
 
-    const combined = signal
-      ? AbortSignal.any([signal, connectTimeout.signal])
-      : connectTimeout.signal;
+    const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
 
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.baseUrl}${path}`, {
         method,
-        headers: { 'content-type': 'application/json', accept: 'text/event-stream, application/json' },
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream, application/json',
+        },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: combined,
       });
-    } finally {
+    } catch (error) {
       clearTimeout(timer);
+      throw error;
     }
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new TrueForgeError(
-        `${method} ${path} failed with ${res.status}`,
-        res.status,
-        text,
-      );
+      // An error body is finite whichever kind of request this was, so it is
+      // read under the deadline.
+      let text = '';
+      try {
+        text = await res.text();
+      } catch {
+        text = '';
+      } finally {
+        clearTimeout(timer);
+      }
+      throw new TrueForgeError(`${method} ${path} failed with ${res.status}`, res.status, text);
     }
-    return res;
+
+    return settle(res, timer);
   }
 }
 
