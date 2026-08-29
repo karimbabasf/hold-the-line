@@ -14,6 +14,12 @@
  *   - `run_ids` come back identical, proving the figures were not
  *     recomputed, only reloaded.
  *   - `pending_draft` (and `gate_state`) survive a drop mid-edit.
+ *
+ * `harness_session_id` is separate from those three: it is what lets the
+ * bridge reconnect to the *same* TrueForge conversation after its own
+ * process restarts, rather than only after a call leg drops while the
+ * process stays up. The bridge's in-memory map already covers the second
+ * case; this field is what the disk-backed store adds on top of it.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -27,6 +33,11 @@ export interface SessionState {
   transcript_index?: number;
   gate_state?: unknown;
   run_ids?: string[];
+  /** The TrueForge session id the bridge is holding for this caller. Without
+   *  this, a resume after the *telephony process itself* restarts can only
+   *  start a fresh, empty TrueForge session: the other four fields describe
+   *  what to say, but not which live conversation to keep saying it in. */
+  harness_session_id?: string;
 }
 
 export interface StoredSession extends SessionState {
@@ -72,17 +83,61 @@ function isStoreFile(value: unknown): value is StoreFile {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** A record only counts as a real checkpoint if it carries a numeric
+ *  timestamp: without this check, a hand-edited or half-written entry with
+ *  a missing or non-numeric `checkpointed_at` produced `NaN` out of the age
+ *  comparison, which is neither `true` nor `false` for "greater than the
+ *  window" and so was returned as if it were a fresh, valid checkpoint. */
+function isStoredSession(value: unknown): value is StoredSession {
+  if (typeof value !== 'object' || value === null) return false;
+  const at = (value as { checkpointed_at?: unknown }).checkpointed_at;
+  return typeof at === 'number' && Number.isFinite(at);
+}
+
+/** Reads an entry by own property only. `store[phone]` would also return
+ *  anything the object inherits from `Object.prototype` (`toString`,
+ *  `constructor`, and so on), and a caller id of exactly `"__proto__"` or
+ *  `"constructor"` is attacker-reachable: Telnyx passes the caller id
+ *  through as an unvalidated string. `isStoredSession` rejects those
+ *  shapes too, but checking ownership first is the more direct fix. */
+function getEntry(store: StoreFile, phone: string): StoredSession | undefined {
+  return Object.hasOwn(store, phone) ? store[phone] : undefined;
+}
+
+/** Writes an entry with Object.defineProperty rather than `store[phone] =
+ *  value`. Bracket assignment for the literal key "__proto__" does not
+ *  create an own property on a normal object: it invokes the inherited
+ *  `Object.prototype.__proto__` setter and replaces the store's prototype
+ *  instead, which would corrupt every other entry's lookups. defineProperty
+ *  always creates or overwrites an own data property, whatever the key. */
+function setEntry(store: StoreFile, phone: string, session: StoredSession): void {
+  Object.defineProperty(store, phone, {
+    value: session,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+function isMissingFileError(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'ENOENT';
+}
+
+/** Throws on anything other than "the file does not exist yet", which
+ *  checkpoint() and resume() then handle differently: a missing file is a
+ *  normal empty store, but a present-and-broken file is not something
+ *  checkpoint() may paper over by silently replacing it (see checkpoint()).
+ */
 async function readStore(path: string): Promise<StoreFile> {
+  let raw: string;
   try {
-    const raw = await readFile(path, 'utf8');
-    const parsed: unknown = JSON.parse(raw);
-    return isStoreFile(parsed) ? parsed : {};
-  } catch {
-    // Missing file, unreadable file, or invalid JSON all land here. A
-    // broken checkpoint must never take a live call down, so this degrades
-    // to "nobody has a checkpoint" instead of throwing.
-    return {};
+    raw = await readFile(path, 'utf8');
+  } catch (err) {
+    if (isMissingFileError(err)) return {};
+    throw err;
   }
+  const parsed: unknown = JSON.parse(raw);
+  return isStoreFile(parsed) ? parsed : {};
 }
 
 async function writeStore(path: string, data: StoreFile): Promise<void> {
@@ -103,15 +158,38 @@ export async function checkpoint(
 ): Promise<void> {
   const path = storePath();
   await serialize(async () => {
-    const store = await readStore(path);
-    store[phone] = { ...(store[phone] ?? {}), ...state, checkpointed_at: atMs };
+    let store: StoreFile;
+    try {
+      store = await readStore(path);
+    } catch (err) {
+      // The file exists but could not be read or parsed (bad permissions, a
+      // transient I/O error, or JSON that got corrupted some other way).
+      // readStore() already treats "missing" as a normal empty store, so
+      // reaching here means something is actually wrong. Writing anyway
+      // would replace it with a store holding only this one caller, which
+      // silently erases every other session on disk over what might be a
+      // recoverable problem. Refuse instead: the live call carries on
+      // either way, and the broken file is left for a human to look at.
+      console.error(`session store: refusing to checkpoint ${phone}, could not read the existing store:`, err);
+      return;
+    }
+    setEntry(store, phone, { ...(getEntry(store, phone) ?? {}), ...state, checkpointed_at: atMs });
     await writeStore(path, store);
   });
 }
 
 export async function resume(phone: string, withinMs: number): Promise<StoredSession | null> {
-  const store = await readStore(storePath());
-  const found = store[phone];
-  if (!found || Date.now() - found.checkpointed_at > withinMs) return null;
+  let store: StoreFile;
+  try {
+    store = await readStore(storePath());
+  } catch {
+    // Missing, unreadable, or invalid JSON. A broken checkpoint must never
+    // take a live call down, so this degrades to "nobody has a checkpoint"
+    // instead of throwing.
+    return null;
+  }
+  const found = getEntry(store, phone);
+  if (!isStoredSession(found)) return null;
+  if (Date.now() - found.checkpointed_at > withinMs) return null;
   return found;
 }

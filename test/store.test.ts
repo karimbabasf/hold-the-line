@@ -70,13 +70,69 @@ test('a corrupt store file returns null instead of throwing', async () => {
   assert.equal(await resume('+14155550160', 10 * 60_000), null);
 });
 
-test('a corrupt store file does not block a later checkpoint', async () => {
+test('a corrupt store file is not silently overwritten by the next checkpoint', async () => {
   const path = freshStorePath();
   process.env.SESSION_STORE_PATH = path;
   await writeFile(path, '{ this is not json', 'utf8');
+
+  // Must not throw: a broken store can never take a live call down.
   await checkpoint('+14155550162', { transcript_index: 1 });
-  const s = await resume('+14155550162', 10 * 60_000);
-  assert.equal(s?.transcript_index, 1);
+
+  // Must also not have clobbered the file. The old behaviour treated any
+  // read failure as an empty store and wrote straight over it, which would
+  // silently erase every other caller's checkpoint over what might be a
+  // transient read error. The file is left exactly as broken as it was,
+  // for a human to recover, rather than replaced with just this one entry.
+  assert.equal(await readFile(path, 'utf8'), '{ this is not json');
+
+  // resume() still degrades to null rather than throwing.
+  assert.equal(await resume('+14155550162', 10 * 60_000), null);
+});
+
+test('a malformed individual record does not resume even though the file is valid JSON', async () => {
+  const path = freshStorePath();
+  process.env.SESSION_STORE_PATH = path;
+  // Written by hand, not through checkpoint(): valid JSON, but the entry is
+  // missing checkpointed_at. Date.now() - undefined is NaN, and NaN is
+  // neither greater than nor less than the window, so a naive age check
+  // would let this through as if it were a fresh checkpoint.
+  await writeFile(path, JSON.stringify({ '+14155550163': { pending_draft: 'x' } }), 'utf8');
+  assert.equal(await resume('+14155550163', 10 * 60_000), null);
+});
+
+test('a non-object record does not resume', async () => {
+  const path = freshStorePath();
+  process.env.SESSION_STORE_PATH = path;
+  await writeFile(path, JSON.stringify({ '+14155550164': 'not an object' }), 'utf8');
+  assert.equal(await resume('+14155550164', 10 * 60_000), null);
+});
+
+test('a caller id that collides with a prototype property name stores and resumes safely', async () => {
+  process.env.SESSION_STORE_PATH = freshStorePath();
+  // "__proto__" as a plain object key does not create an own property by
+  // default, it reassigns the object's prototype through the inherited
+  // setter. Telnyx passes the caller id through unvalidated, so this is
+  // reachable, not just theoretical.
+  await checkpoint('__proto__', { transcript_index: 5 });
+  const polluted = await resume('__proto__', 60_000);
+  assert.equal(polluted?.transcript_index, 5);
+
+  // And an unrelated, ordinary number checkpointed afterward is unaffected,
+  // proving the store's prototype itself was never touched.
+  await checkpoint('+14155550190', { transcript_index: 1 });
+  const normal = await resume('+14155550190', 60_000);
+  assert.equal(normal?.transcript_index, 1);
+});
+
+test('the harness session id survives a resume', async () => {
+  process.env.SESSION_STORE_PATH = freshStorePath();
+  const phone = '+14155550153';
+  // This is what lets the bridge reconnect to the same TrueForge
+  // conversation after its own process restarts, rather than starting a
+  // fresh, empty session and losing everything the model itself remembers.
+  await checkpoint(phone, { harness_session_id: 'sess-7c21', transcript_index: 3 });
+  const s = await resume(phone, 60_000);
+  assert.equal(s?.harness_session_id, 'sess-7c21');
 });
 
 test('concurrent checkpoints for one number do not corrupt the file', async () => {
