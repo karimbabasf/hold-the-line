@@ -112,7 +112,11 @@ function formatClock(ms: number): string {
  */
 export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return '-';
-  if (ms < 1) return '<1 ms';
+  if (ms === 0) return '0 ms';
+  // The live harness reports fractional milliseconds (0.688, 8.837). One
+  // decimal under 10 ms keeps those distinguishable instead of rounding a
+  // whole fan-out to the same "1 ms".
+  if (ms < 10) return `${ms.toFixed(1)} ms`;
   if (ms < 1000) return `${Math.round(ms)} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
 }
@@ -933,7 +937,9 @@ function onCall(ev: CallEvent): void {
     callLive = true;
     callEndedAtCallTime = null;
     el('caller-name').textContent = ev.caller ?? 'Caller';
-    el('claim-line').textContent = ev.claim_id ? `Claim ${ev.claim_id}` : '';
+    // "Claim CLM-40218" says claim twice. The caller and the agent both call
+    // it claim 40218, so the screen does too.
+    el('claim-line').textContent = ev.claim_id ? `Claim ${ev.claim_id.replace(/^CLM-/i, '')}` : '';
     applyScreen();
     return;
   }

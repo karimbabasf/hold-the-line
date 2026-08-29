@@ -505,12 +505,12 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
     { type: 'number', t: 32_900, label: 'Total loss threshold', value: 75, from: 'record', source: 'state_rules.total_loss_threshold_pct', unit: 'percent', spoken: true },
 
     { type: 'transcript', t: 33000, who: 'agent', text: 'Your car was worth 21,340 dollars. Repairs came to 16,780, which is 78.6 percent of that, and our threshold in this state is 75. So yes, it is a total loss.', final: true },
+    { type: 'transcript', t: 37600, who: 'agent', text: 'After tax and fees, less your thousand-dollar deductible, less the payoff to Cascade, you are at 13,481 dollars and 12 cents.', final: true },
     // 0:38, walking the net figure.
     { type: 'number', t: 38_000, label: 'Sales tax', value: 1_835.24, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
     { type: 'number', t: 38_300, label: 'Collision deductible', value: 1_000.0, from: 'record', source: 'policy.deductible_collision', unit: 'usd', spoken: true },
     { type: 'number', t: 38_600, label: 'Net settlement, cash', value: 13_481.12, from: 'computed', run_id: RUN_CASH, unit: 'usd', spoken: true },
 
-    { type: 'transcript', t: 37600, who: 'agent', text: 'After tax and fees, less your thousand-dollar deductible, less the payoff to Cascade, you are at 13,481 dollars and 12 cents.', final: true },
     { type: 'transcript', t: 43000, who: 'caller', text: "Hold on. My statement said 8,700. Where's 8,764 coming from?", final: true },
     { type: 'transcript', t: 44600, who: 'agent', text: 'Your loan accrues 1 dollar 84 cents a day.', final: false },
     // 0:45, THE PROOF BEAT. The caller's statement shows the principal
