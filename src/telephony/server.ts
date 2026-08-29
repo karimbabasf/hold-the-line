@@ -12,6 +12,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { encodeSSE, type ConsoleEvent } from '../console/events.ts';
 import { TrueForgeClient } from '../trueforge/client.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
 import { createBridge } from './harness-bridge.ts';
@@ -49,11 +50,45 @@ const PORT = Number(process.env.PORT ?? 8791);
 const AGENT_NAME = process.env.TRUEFORGE_AGENT ?? 'northvane';
 const TRUEFORGE_BASE_URL = process.env.TRUEFORGE_BASE_URL ?? 'http://localhost:8790';
 
+const sseClients = new Set<ServerResponse>();
+let sseSeq = 0;
+
+function broadcast(event: ConsoleEvent): void {
+  const frame = encodeSSE(event, sseSeq++);
+  for (const client of sseClients) {
+    client.write(frame);
+  }
+}
+
+let currentCallStart = Date.now();
+
 const bridge = createBridge({
   forge: new TrueForgeClient({ baseUrl: TRUEFORGE_BASE_URL }),
   agentName: AGENT_NAME,
-  onApprovalRequired: (toolCalls) => {
-    console.log('[gate] approval required:', JSON.stringify(toolCalls));
+  onApprovalRequired: (event, _callerId) => {
+    console.log('[gate] approval required:', JSON.stringify(event.tool_calls));
+    const t = Date.now() - currentCallStart;
+    for (const tc of event.tool_calls) {
+      const args = tc.arguments as Record<string, unknown> | undefined;
+      const toolName = (args?.tool_name as string) ?? tc.name ?? 'unknown';
+      const input = args?.input as Record<string, unknown> | undefined;
+      const utterance = input?.utterance;
+      const gateEvent: ConsoleEvent = {
+        type: 'gate',
+        t,
+        id: tc.id,
+        tool: toolName,
+        status: 'opened',
+        ...(typeof utterance === 'string' ? { wanted: utterance } : {}),
+      };
+      broadcast(gateEvent);
+    }
+  },
+  onConsoleEvent: (event) => {
+    if (event.type === 'call' && event.status === 'started') {
+      currentCallStart = Date.now();
+    }
+    broadcast(event);
   },
 });
 
@@ -106,6 +141,17 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const url = req.url ?? '/';
       console.log(`${req.method} ${url}`);
+
+      if (url === '/events') {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          'connection': 'keep-alive',
+        });
+        sseClients.add(res);
+        req.on('close', () => { sseClients.delete(res); });
+        return;
+      }
 
       // The operator console, served straight from source.
       //

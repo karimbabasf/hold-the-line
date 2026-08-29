@@ -8,18 +8,18 @@
  * pull in just enough ambient browser typing for this one file to
  * typecheck under `npx tsc -p tsconfig.json --noEmit`.
  *
- * By default this replays `recordedNorthvaneCall()` from `events.ts` in
- * real time, so the console is demonstrable with no live call and no
- * server. Two query parameters change that for development:
+ * By default this connects live to `/events`, so the operator sees real
+ * call data the moment they open the page. Query parameters switch to the
+ * recorded demo or change playback for development:
  *
- *   ?speed=20        replay faster than real time (debugging, not demo).
- *   ?until=71000     dispatch every event with t <= 71000 instantly, then
- *                     freeze there. Used to capture docs/console.png with
- *                     the gate open and the hold clock already running.
- *   ?live=1          connect to a real emitter at /events instead of
- *                     replaying the fixture, once one exists.
+ *   ?demo             replay `recordedNorthvaneCall()` in real time.
+ *   ?speed=20         replay faster than real time (debugging, not demo).
+ *   ?until=71000      dispatch every event with t <= 71000 instantly, then
+ *                      freeze there. Used to capture docs/console.png with
+ *                      the gate open and the hold clock already running.
+ *   ?live=<url>       connect to a custom emitter URL instead of /events.
  *
- * None of the three change the event contract in `events.ts`; they only
+ * None of these change the event contract in `events.ts`; they only
  * change how this file schedules dispatch.
  */
 
@@ -609,16 +609,25 @@ function main(): void {
   setInterval(tickClocks, 250);
 
   const params = new URLSearchParams(window.location.search);
-  const live = params.get('live');
-  if (live) {
-    startLive(live === '1' ? '/events' : live);
+
+  // Demo replay requires an explicit ?demo param, or ?speed / ?until.
+  // Without any of those, the console connects live to /events so the
+  // operator sees real call data the moment they open the page.
+  const demo = params.has('demo');
+  const speedParam = params.get('speed');
+  const untilParam = params.get('until');
+
+  if (demo || speedParam !== null || untilParam !== null) {
+    const speed = Number(speedParam ?? '1') || 1;
+    const until = untilParam !== null && untilParam !== '' ? Number(untilParam) : null;
+    startReplay(recordedNorthvaneCall(), speed, until);
     return;
   }
 
-  const speed = Number(params.get('speed') ?? '1') || 1;
-  const untilParam = params.get('until');
-  const until = untilParam !== null && untilParam !== '' ? Number(untilParam) : null;
-  startReplay(recordedNorthvaneCall(), speed, until);
+  // Default: live mode. ?live=<url> overrides the endpoint.
+  const liveParam = params.get('live');
+  const liveUrl = liveParam && liveParam !== '1' ? liveParam : '/events';
+  startLive(liveUrl);
 }
 
 // This file is imported under plain Node by test/loadable.test.ts, which

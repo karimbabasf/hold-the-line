@@ -7,17 +7,22 @@
  * therefore outside the approval gate.
  */
 
+import type { ConsoleEvent } from '../console/events.ts';
 import { checkpoint, resume } from '../session/store.ts';
 import type { TrueForgeClient } from '../trueforge/client.ts';
-import { isApprovalRequired } from '../trueforge/types.ts';
+import { isApprovalRequired, type ToolApprovalRequiredEvent } from '../trueforge/types.ts';
 import type { TurnDelta } from './chat-endpoint.ts';
 
 export interface BridgeOptions {
   forge: TrueForgeClient;
   agentName: string;
-  /** Called when the harness parks a gated tool call. Task 5 routes this to
-   *  the operator console. It is never auto-approved. */
-  onApprovalRequired?: (toolCalls: unknown) => void;
+  /** Called when the harness parks a gated tool call. Receives the full
+   *  approval event and the caller id so the console can build a gate event
+   *  with the right tool name and timing. */
+  onApprovalRequired?: (event: ToolApprovalRequiredEvent, callerId: string) => void;
+  /** Called with every console event the bridge emits (call start, session
+   *  resume). The server broadcasts these to SSE clients. */
+  onConsoleEvent?: (event: ConsoleEvent) => void;
   /** How long after a disconnect a caller can ring back and continue the same
    *  conversation. Ten minutes: long enough for a dropped call and a walk to
    *  better signal, short enough that a stranger on a recycled number does
@@ -81,11 +86,18 @@ export function createBridge(opts: BridgeOptions) {
    * the same figures rather than starting over. It also survives a restart of
    * this process, which the map alone did not.
    */
-  async function sessionFor(callerId: string): Promise<{ id: string; resumed: boolean }> {
+  /** When each caller's call started, for computing event t values. */
+  const callStartTimes = new Map<string, number>();
+
+  function callT(callerId: string): number {
+    return Date.now() - (callStartTimes.get(callerId) ?? Date.now());
+  }
+
+  async function sessionFor(callerId: string): Promise<{ id: string; resumed: boolean; isNew: boolean }> {
     const live = sessions.get(callerId);
     if (live) {
       remember(callerId, live);
-      return { id: live, resumed: false };
+      return { id: live, resumed: false, isNew: false };
     }
 
     // A resume that throws is a resume that did not happen, never a failed
@@ -96,7 +108,7 @@ export function createBridge(opts: BridgeOptions) {
       remember(callerId, harnessId);
       // Nothing is recomputed. The same run ids come back with it, which is
       // what proves the state survived rather than being regenerated.
-      return { id: harnessId, resumed: true };
+      return { id: harnessId, resumed: true, isNew: false };
     }
 
     const id = await opts.forge.createSession(opts.agentName);
@@ -109,7 +121,7 @@ export function createBridge(opts: BridgeOptions) {
         console.warn('could not checkpoint a new session:', err);
       },
     );
-    return { id, resumed: false };
+    return { id, resumed: false, isNew: true };
   }
 
   /**
@@ -131,8 +143,27 @@ export function createBridge(opts: BridgeOptions) {
     sessions,
     wasResumed,
     async *runTurn(userText: string, callerId: string): AsyncGenerator<TurnDelta> {
-      const { id: sessionId, resumed } = await sessionFor(callerId);
-      if (resumed) pendingResume.add(callerId);
+      const { id: sessionId, resumed, isNew } = await sessionFor(callerId);
+
+      // Emit console events for session lifecycle changes.
+      if (isNew) {
+        callStartTimes.set(callerId, Date.now());
+        opts.onConsoleEvent?.({
+          type: 'call', t: 0, status: 'started', caller: callerId,
+        });
+      }
+      if (resumed) {
+        pendingResume.add(callerId);
+        // The start time is lost across a process restart, so anchor the
+        // clock to "now" on resume. The console's syncClockToLive adjusts.
+        if (!callStartTimes.has(callerId)) {
+          callStartTimes.set(callerId, Date.now());
+        }
+        opts.onConsoleEvent?.({
+          type: 'session', t: callT(callerId), status: 'resumed',
+          session_id: sessionId,
+        });
+      }
 
       // The cue has to reach the agent, not just sit in a flag the endpoint
       // never reads. Prefixing the turn is what actually produces the
@@ -151,7 +182,7 @@ export function createBridge(opts: BridgeOptions) {
         if (isApprovalRequired(event)) {
           // Never auto-approved here. Auto-approving would defeat the entire
           // point of the project.
-          opts.onApprovalRequired?.(event.tool_calls);
+          opts.onApprovalRequired?.(event, callerId);
           continue;
         }
 
