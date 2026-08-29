@@ -12,6 +12,7 @@ import { checkpoint, resume } from '../session/store.ts';
 import type { TrueForgeClient } from '../trueforge/client.ts';
 import { isApprovalRequired, type ToolApprovalRequiredEvent } from '../trueforge/types.ts';
 import type { TurnDelta } from './chat-endpoint.ts';
+import { createSpeechShaper } from './speech.ts';
 
 export interface BridgeOptions {
   forge: TrueForgeClient;
@@ -47,6 +48,17 @@ export function extractText(event: { type: string; [k: string]: unknown }): stri
   if (event.type !== 'model.message.delta') return null;
   const content = event['content'];
   return typeof content === 'string' && content.length > 0 ? content : null;
+}
+
+/**
+ * True for the empty opener that begins each harness message.
+ *
+ * One live turn carries several of these, one per tool round, and they are the
+ * only signal that the next word starts a new sentence rather than continuing
+ * the last one.
+ */
+export function isMessageStart(event: { type: string }): boolean {
+  return event.type === 'model.message';
 }
 
 export function createBridge(opts: BridgeOptions) {
@@ -176,6 +188,11 @@ export function createBridge(opts: BridgeOptions) {
           `and do not recompute anything.]\n\n${userText}`
         : userText;
 
+      // One shaper per turn. It owns everything between the harness and the
+      // caller's ear: the space between two messages, the repeated filler, and
+      // the figures. See speech.ts for why each of those is here.
+      const shaper = createSpeechShaper();
+
       for await (const event of opts.forge.streamTurn(sessionId, [
         { type: 'user.message', content },
       ])) {
@@ -186,9 +203,24 @@ export function createBridge(opts: BridgeOptions) {
           continue;
         }
 
+        // Each tool round opens its own message. Without this the last word of
+        // one round and the first word of the next arrive glued together and
+        // TTS reads the period as a stumble.
+        if (isMessageStart(event)) {
+          const flushed = shaper.startMessage();
+          if (flushed) yield { type: 'message.delta', text: flushed };
+          continue;
+        }
+
         const text = extractText(event);
-        if (text) yield { type: 'message.delta', text };
+        if (text) {
+          const spoken = shaper.push(text);
+          if (spoken) yield { type: 'message.delta', text: spoken };
+        }
       }
+
+      const tail = shaper.end();
+      if (tail) yield { type: 'message.delta', text: tail };
 
       // Checkpoint after every turn rather than on disconnect, because a
       // dropped call gives no disconnect to hook. The line just stops.
