@@ -76,6 +76,11 @@ function decideGate(id: string, decision: ApprovalDecision | null): boolean {
 
 const bridge = createBridge({
   forge: new TrueForgeClient({ baseUrl: TRUEFORGE_BASE_URL }),
+  // The link on the sandbox panel opens in the OPERATOR's browser, so it has
+  // to be the host TrueForge is actually served from. Without this the bridge
+  // fell back to localhost independently of the API client, and a remote or
+  // proxied harness sent every operator to a page on their own machine.
+  harnessUrl: TRUEFORGE_BASE_URL,
   agentName: AGENT_NAME,
   onApprovalRequired: (gate, _callerId) => {
     console.log(`[gate] approval required: ${gate.tool} ${gate.tool_call_id}`);

@@ -91,3 +91,21 @@ test('the container id is shortened to the parts that identify it', () => {
   assert.equal(shortSandboxId('sess-7c21'), 'sess-7c21');
   assert.equal(shortSandboxId('01m17kwn46bj5vgebfzhq0a5wr'), '01m17kwn46bj5vgebfzhq0a5wr');
 });
+
+test('a continuation never reaches across the other speaker turn', () => {
+  // The transcript keeps ONE settled line, not one per speaker. Per speaker,
+  // a caller's "Yes." followed by an agent turn and then a new caller line
+  // starting "Yes, ..." rewrote the caller bubble ABOVE the agent's, putting
+  // the transcript out of order. Found by Qodo. `continuesLine` is only ever
+  // asked about the line at the bottom of the screen now, so the guard is
+  // that the caller's own earlier line is no longer a candidate.
+  const callerYes = { text: 'Yes.', t: 10_000 };
+  const agentTurn = { text: 'Then I will read that back.', t: 12_000 };
+
+  // The agent spoke last, so the agent's line is what a later line is
+  // compared against, and a caller line does not continue it.
+  assert.equal(continuesLine(agentTurn, { text: 'Yes. And the rental?', t: 14_000 }), false);
+  // The caller's own earlier line would still match on text alone, which is
+  // exactly why it must not be the line that is offered.
+  assert.equal(continuesLine(callerYes, { text: 'Yes. And the rental?', t: 14_000 }), true);
+});

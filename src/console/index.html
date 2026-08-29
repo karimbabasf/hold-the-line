@@ -655,6 +655,12 @@
   .box[data-run="running"] { border-color: var(--paper); }
   .box[data-run="running"] .box-scan { animation: sweep 1.5s linear infinite; }
   .box[data-run="running"] .box-glyph { animation: nudge 1.5s ease-in-out infinite; }
+  /* A run that has just finished, not one still going: ONE pass of the line,
+     not a loop of it, and the border settles green rather than staying
+     paper. A loop here would claim the container is busy after the bridge
+     said it was not. */
+  .box[data-run="ran"] { border-color: var(--settled); }
+  .box[data-run="ran"] .box-scan { animation: sweep 900ms var(--ease-out) 1; }
   @keyframes sweep {
     0% { opacity: 0; transform: translateY(0); }
     12% { opacity: 0.9; }
@@ -663,6 +669,9 @@
   }
   @keyframes nudge { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
   body[data-state="ended"] .box-scan, body[data-state="ended"] .box-glyph { animation: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .box[data-run="ran"] .box-scan { animation: none; }
+  }
 
   .runs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; flex: none; }
   .run {

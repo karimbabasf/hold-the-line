@@ -256,7 +256,7 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
    * call frame at all, only the session that resumed. Everything else is safe
    * to lose to the bound.
    */
-  const pinned = new Map<'call' | 'hold' | 'session', Frame>();
+  const pinned = new Map<'call' | 'hold' | 'session' | 'sandbox', Frame>();
 
   const ledger = new Map<string, Provenance>();
   const alreadySpoken = new Set<string>();
@@ -332,6 +332,15 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     if (event.type === 'call' && event.status === 'started') pinned.set('call', frame);
     else if (event.type === 'hold') pinned.set('hold', frame);
     else if (event.type === 'session') pinned.set('session', frame);
+    // A session announces its container once, and a session that never runs
+    // code announces nothing after it. So a console attaching after the
+    // buffer has rolled would show "Not attached yet" against a live
+    // session, and might never be corrected. `running` is deliberately not
+    // pinned: replaying it to a late client would assert compute that
+    // finished long ago.
+    else if (event.type === 'sandbox' && event.status !== 'running') {
+      pinned.set('sandbox', frame);
+    }
     while (buffer.length > bufferLimit) buffer.shift();
   }
 
@@ -340,6 +349,14 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     // process's own reading, because it is the only one that knows when this
     // call was answered and it has to stay consistent across the two
     // processes reporting into it.
+    //
+    // The exception is a `sandbox` event, which is the only kind that
+    // reports a time this process could not have observed: TrueForge
+    // announces no start of execution, so the bridge dates `running` back
+    // across the silence it sat through. Restamping that with the arrival
+    // time collapsed the run to zero and lost the one measurement the panel
+    // exists to show. Its own `t` is kept, clamped so it can never predate
+    // the call or run ahead of the clock.
     if (event.type === 'call' && event.status === 'started') {
       callStart = at ?? now();
       currentCaller = event.caller ?? null;
@@ -383,9 +400,13 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
       callOver = false;
       onHold = false;
     }
+    const clock = callStart === null ? 0 : Math.max(0, (at ?? now()) - callStart);
+    // A `sandbox` event is the only one carrying a time this process could
+    // not have observed, so it keeps its own, clamped into this call.
+    const keepsOwnTime = event.type === 'sandbox' && event.t > 0;
     const stamped = {
       ...event,
-      t: callStart === null ? 0 : Math.max(0, (at ?? now()) - callStart),
+      t: keepsOwnTime ? Math.min(clock, Math.max(0, event.t)) : clock,
     } as ConsoleEvent;
 
     if (stamped.type === 'number' && !stamped.spoken) {

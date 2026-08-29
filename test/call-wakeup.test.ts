@@ -264,3 +264,54 @@ test('the webhook lights the console up before anyone has said anything', () => 
   assert.equal(seen.events().filter((e) => e['type'] === 'call' && e['status'] === 'started').length, 1);
   assert.equal(seen.events().filter((e) => e['type'] === 'transcript').length, 1);
 });
+
+test('a sandbox event keeps its own timing, and attachment survives the buffer', () => {
+  const live = createLiveConsole();
+  const t0 = Date.now();
+
+  // `at` drives the call clock, so this reads like a call that has been
+  // running for twenty seconds rather than one answered this instant.
+  live.broadcast({ type: 'call', t: 0, status: 'started', caller: '+14155550101' } as never, t0);
+  live.broadcast(
+    { type: 'sandbox', t: 0, status: 'attached', id: 'sess-1', url: 'http://h/sessions/sess-1' } as never,
+    t0 + 500,
+  );
+
+  const seen = watch(live);
+  // The bridge dates `running` back across the silence it sat through,
+  // because TrueForge announces no start of execution. Restamping that with
+  // the arrival time collapsed the run to zero and lost the one measurement
+  // the panel exists to show. Found by Qodo.
+  live.broadcast(
+    { type: 'sandbox', t: 4_000, status: 'running', id: 'sess-1', label: 'exec' } as never,
+    t0 + 18_500,
+  );
+  live.broadcast({ type: 'sandbox', t: 18_500, status: 'idle', id: 'sess-1' } as never, t0 + 18_500);
+
+  const events = seen.events();
+  // A late client is handed the attachment even though it happened before it
+  // connected, or the panel says "Not attached yet" against a live session.
+  assert.ok(
+    events.some((e) => e['type'] === 'sandbox' && e['status'] === 'attached'),
+    'the attachment was not replayed to a late client',
+  );
+
+  const running = events.find((e) => e['type'] === 'sandbox' && e['status'] === 'running');
+  const idle = events.find((e) => e['type'] === 'sandbox' && e['status'] === 'idle');
+  assert.equal(running?.['t'], 4_000, 'the backdated start was restamped with the arrival time');
+  assert.equal(idle?.['t'], 18_500);
+  // Which is the whole point: the panel can report a real run length.
+  assert.equal((idle?.['t'] as number) - (running?.['t'] as number), 14_500);
+});
+
+test('a sandbox time is clamped into the call it belongs to', () => {
+  const live = createLiveConsole();
+  const seen = watch(live);
+  live.callStarted('+14155550101', '+14155550101');
+  // A `t` from the future would put the run ahead of the call clock and make
+  // the panel report a duration nobody waited.
+  live.broadcast({ type: 'sandbox', t: 9_000_000, status: 'running', id: 'sess-1' } as never);
+
+  const running = seen.events().find((e) => e['type'] === 'sandbox' && e['status'] === 'running');
+  assert.ok((running?.['t'] as number) < 9_000_000, 'a future timestamp was taken at face value');
+});

@@ -391,10 +391,17 @@ function paintRig(): void {
 
 function setTool(tool: string, status: ToolStatus, took?: string, said?: string): void {
   const state = toolRow(tool);
-  // A tool that has already returned is not walked backwards by a late
-  // frame. The one exception is a gate opening on it, which is the operator
-  // being asked about a call that HAS returned and is waiting to be spoken.
-  if (state.status === 'done' && status === 'pending') return;
+  // A finished tool going pending again is a SECOND invocation, not a late
+  // frame: `settlement.calculate` runs twice on the recorded call, once for
+  // cash and once with salvage retained, and `offer.state_settlement` runs
+  // twice around a send-back. Dropping it left the pipe green while the
+  // second run was actually in flight. The elapsed time from the first run
+  // is cleared with it, so a finished figure is never shown against a call
+  // still running.
+  if (status === 'pending' && state.status === 'done') {
+    state.took = '';
+    state.said = '';
+  }
   if (status === 'pending' && state.status !== 'pending') fireHub();
 
   state.status = status;
@@ -503,9 +510,17 @@ const unfinished = new Map<TranscriptEvent['who'], HTMLElement>();
 /** The dots bubble standing in for a speaker who has started talking but
  *  whose words have not landed yet. At most one per speaker. */
 const speaking = new Map<TranscriptEvent['who'], HTMLElement>();
-/** The last settled line from each speaker, kept so a longer transcription
- *  of the same words extends it instead of stacking beside it. */
-const settledLine = new Map<TranscriptEvent['who'], { node: HTMLElement; text: string; t: number }>();
+/**
+ * The last settled line on the transcript, whoever said it.
+ *
+ * Kept as ONE entry rather than one per speaker. Per speaker, a caller's
+ * "Yes." followed by an agent turn and then a new caller line beginning
+ * "Yes, ..." would rewrite the caller bubble ABOVE the agent's, putting the
+ * transcript out of order. Only the line at the bottom of the screen can be
+ * the one still being transcribed. Found by Qodo.
+ */
+let settledLine: { who: TranscriptEvent['who']; node: HTMLElement; text: string; t: number } | null =
+  null;
 
 /**
  * True when a settled line is the same utterance as the one before it, only
@@ -641,11 +656,16 @@ function onTranscript(ev: TranscriptEvent): void {
   // twice, once truncated, which reads on camera as the console losing
   // track of the call. A line that contains the previous one is the same
   // line, so it extends it and only the new words animate.
-  const settled = settledLine.get(ev.who);
-  if (settled !== undefined && !unfinished.has(ev.who) && continuesLine(settled, ev)) {
+  const settled = settledLine;
+  if (
+    settled !== null &&
+    settled.who === ev.who &&
+    !unfinished.has(ev.who) &&
+    continuesLine(settled, ev)
+  ) {
     const grown = settled.node.querySelector<HTMLElement>('.line-text');
     if (grown) paintWords(grown, ev.text);
-    settledLine.set(ev.who, { node: settled.node, text: ev.text, t: ev.t });
+    settledLine = { who: ev.who, node: settled.node, text: ev.text, t: ev.t };
     if (ev.who === 'caller' && ev.final && callLive) showSpeaking('agent');
     scrollTranscript();
     return;
@@ -667,7 +687,7 @@ function onTranscript(ev: TranscriptEvent): void {
   node.className = `line line--${ev.who}${ev.final ? '' : ' line--partial'}`;
   if (ev.final) {
     unfinished.delete(ev.who);
-    settledLine.set(ev.who, { node, text: ev.text, t: ev.t });
+    settledLine = { who: ev.who, node, text: ev.text, t: ev.t };
   } else {
     unfinished.set(ev.who, node);
   }
@@ -686,7 +706,7 @@ function markTranscriptEnd(ms: number): void {
     node.className = `line line--${who}`;
   }
   unfinished.clear();
-  settledLine.clear();
+  settledLine = null;
   const box = el('transcript');
   if (box.querySelector('.line-end')) return;
   if (box.querySelector('.transcript-empty')) return;
@@ -728,30 +748,30 @@ function renderRuns(): void {
 }
 
 /**
- * How long the running state stays on screen at minimum.
+ * How long the "a run just finished" pulse lasts.
  *
- * The harness announces no start of execution: it goes quiet, then sends
- * `sandbox.created` and the tool response in the same millisecond. So the
- * bridge dates `running` back to the start of the silence and sends both
- * statuses at once, and a panel that applied them as they arrived would
- * flash for zero frames and look like nothing ran. The run genuinely
- * happened across that window, so the tile shows it across that window.
+ * The sweep means the container is executing RIGHT NOW, so it has to stop
+ * the moment the bridge says idle: holding it on for a fixed dwell made the
+ * panel assert live compute after completion, which is the one thing this
+ * screen must not do. Found by Qodo.
+ *
+ * That leaves a live call with nothing to see, because TrueForge announces
+ * no start of execution and the bridge therefore reports both ends in the
+ * same tick. So a finished run gets a single pass of the same line rather
+ * than a loop of it, and the tile says how long the run actually took. One
+ * pass reads as "something happened here"; a loop would read as "something
+ * is happening here", and only one of those would be true.
  */
-const SANDBOX_MIN_RUN_MS = 1_400;
+const SANDBOX_PULSE_MS = 900;
 
 let sandboxRunAt: number | null = null;
-let sandboxIdleTimer: ReturnType<typeof setTimeout> | null = null;
-
-function setSandboxIdle(box: HTMLAnchorElement, id: string | undefined, ran: string): void {
-  box.dataset['run'] = 'idle';
-  if (id) el('sandbox-id').textContent = ran ? `${shortSandboxId(id)} \u00b7 ran ${ran}` : shortSandboxId(id);
-}
+let sandboxPulseTimer: ReturnType<typeof setTimeout> | null = null;
 
 function onSandbox(ev: SandboxEvent): void {
   const box = el<HTMLAnchorElement>('sandbox');
-  if (sandboxIdleTimer !== null) {
-    clearTimeout(sandboxIdleTimer);
-    sandboxIdleTimer = null;
+  if (sandboxPulseTimer !== null) {
+    clearTimeout(sandboxPulseTimer);
+    sandboxPulseTimer = null;
   }
 
   if (ev.url) {
@@ -771,21 +791,22 @@ function onSandbox(ev: SandboxEvent): void {
     box.dataset['run'] = 'running';
     el('sandbox-id').textContent = `Running ${ev.label ?? 'code'}`;
   } else if (ev.status === 'idle') {
-    // The real length of the run, off the two events' own call clocks, not
-    // off how long this panel happened to take to receive them.
+    // The real length of the run, off the two events' own call clocks, which
+    // survive the trip now, not off how long this panel took to receive them.
     const ranMs = sandboxRunAt === null ? 0 : Math.max(0, ev.t - sandboxRunAt);
-    const ran = ranMs > 0 ? formatDuration(ranMs) : '';
-    // Only hold when this panel is actually showing a run. An `idle` on its
-    // own, which is what a console joining mid-call receives, settles at once.
     const wasRunning = box.dataset['run'] === 'running';
     sandboxRunAt = null;
+    // The sweep stops here, immediately. Nothing is executing any more.
+    box.dataset['run'] = wasRunning ? 'ran' : 'idle';
+    if (ev.id) {
+      el('sandbox-id').textContent =
+        ranMs > 0 ? `${shortSandboxId(ev.id)} \u00b7 ran ${formatDuration(ranMs)}` : shortSandboxId(ev.id);
+    }
     if (wasRunning) {
-      sandboxIdleTimer = setTimeout(() => {
-        sandboxIdleTimer = null;
-        setSandboxIdle(box, ev.id, ran);
-      }, SANDBOX_MIN_RUN_MS);
-    } else {
-      setSandboxIdle(box, ev.id, ran);
+      sandboxPulseTimer = setTimeout(() => {
+        sandboxPulseTimer = null;
+        box.dataset['run'] = 'idle';
+      }, SANDBOX_PULSE_MS);
     }
   } else if (ev.id) {
     el('sandbox-id').textContent = shortSandboxId(ev.id);
@@ -1508,9 +1529,9 @@ function resetForNewCall(started: ConsoleEvent): void {
 
   runIds.length = 0;
   renderRuns();
-  if (sandboxIdleTimer !== null) {
-    clearTimeout(sandboxIdleTimer);
-    sandboxIdleTimer = null;
+  if (sandboxPulseTimer !== null) {
+    clearTimeout(sandboxPulseTimer);
+    sandboxPulseTimer = null;
   }
   sandboxRunAt = null;
   const box = el<HTMLAnchorElement>('sandbox');
@@ -1521,7 +1542,7 @@ function resetForNewCall(started: ConsoleEvent): void {
 
   unfinished.clear();
   speaking.clear();
-  settledLine.clear();
+  settledLine = null;
   el('transcript').replaceChildren(h('p', { class: 'transcript-empty' }, ['Nothing said yet.']));
 
   statementLines = [];
@@ -1610,7 +1631,13 @@ function renderCounters(): void {
   // the call, so the one line a judge reads after the hangup is the whole
   // result rather than a header that has simply gone grey.
   if (callEverStarted && !callLive) {
-    const tools = [...toolRows.values()].filter((r) => r.status === 'done').length;
+    // Calls, not rows. Counting rows collapsed a tool invoked twice into one
+    // and dropped failures entirely, so the banner's own claim was wrong on
+    // exactly the runs worth talking about. `state.events` is this call's
+    // stream and is cleared with the call.
+    const tools = state.events.filter(
+      (e) => e.type === 'tool' && (e.status === 'done' || e.status === 'error'),
+    ).length;
     el('ended-sum').textContent = [
       `${formatClock(callEndedAtCallTime ?? 0)} on the line`,
       `${tools} tool ${tools === 1 ? 'call' : 'calls'}`,
