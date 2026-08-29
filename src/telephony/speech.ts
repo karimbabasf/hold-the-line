@@ -66,10 +66,13 @@ function couldBecomeFiller(text: string): boolean {
 }
 
 /**
- * A dollar amount: grouped or plain digits, optional cents.
+ * A dollar amount: grouped or plain digits, and the whole fraction if there
+ * is one.
  *
  * The grouped alternative is first so "$13,481" matches whole rather than
- * stopping at "$13".
+ * stopping at "$13". The fraction is `\d+` rather than `\d{1,2}` so a rate
+ * like $0.085 arrives here complete instead of matching "$0.08" and leaving a
+ * stray digit behind.
  */
 const CURRENCY = /\$(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?/g;
 
@@ -105,9 +108,9 @@ export function speakNumbers(text: string): string {
       if (cents === 0) return `${whole} ${unit}`;
       return `${whole} ${unit} and ${cents} ${cents === 1 ? 'cent' : 'cents'}`;
     })
-    // Same fraction rule for a bare decimal, and the dollar sign in the
-    // lookbehind keeps this off a money token the rule above already shaped or
-    // declined to shape.
+    // Same fraction rule for a bare decimal. The dollar sign in the lookbehind
+    // keeps this off any money-shaped token the rule above did not match, such
+    // as "$.50", rather than half converting it.
     .replace(/(?<!\$[\d,]*)(\d)\.(\d+)/g, (_m, before: string, fraction: string) =>
       `${before} point ${fraction.length > 2 ? spelled(fraction) : fraction}`,
     );
