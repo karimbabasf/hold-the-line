@@ -58,7 +58,7 @@ export function createGateClient(options: GateClientOptions) {
   async function send(request: GateRequest): Promise<GateResult> {
     const token = options.token();
     if (!token) {
-      return { ok: false, error: 'no operator token. paste it before deciding a gate.' };
+      return { ok: false, error: 'No operator key yet. Set it in the bar at the bottom of the screen.' };
     }
 
     let response: Response;

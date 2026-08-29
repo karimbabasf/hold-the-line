@@ -307,12 +307,31 @@ function onLanesSummary(ev: LanesSummaryEvent): void {
   const count = lanes.size || 5;
   const box = el('together');
   box.hidden = false;
+
+  const parallel = formatDuration(ev.parallel_ms);
+  const serial = formatDuration(ev.serial_ms);
+  // "0.4 ms instead of 0.4 ms one after another" is a sentence that argues
+  // with itself, and it is what a local fixture produces: reads that fast
+  // leave no gap to report. The comparison is only made when there is a real
+  // one to make. Otherwise the screen says the true and simpler thing, which
+  // is that the checks happened together, and how long that took. The gap is
+  // never inflated to keep the sentence.
+  const worthComparing = ev.serial_ms > ev.parallel_ms * 1.5 && parallel !== serial;
+
+  if (worthComparing) {
+    box.replaceChildren(
+      `All ${count} checks ran at the same time. `,
+      h('b', {}, [parallel]),
+      ' instead of ',
+      h('b', {}, [serial]),
+      ' one after another.',
+    );
+    return;
+  }
   box.replaceChildren(
-    `All ${count} checks ran at the same time. `,
-    h('b', {}, [formatDuration(ev.parallel_ms)]),
-    ' instead of ',
-    h('b', {}, [formatDuration(ev.serial_ms)]),
-    ' one after another.',
+    `All ${count} checks ran at the same time, in `,
+    h('b', {}, [parallel]),
+    '.',
   );
 }
 
@@ -730,12 +749,6 @@ function renderGateOpen(gate: GateState): void {
   const status = h('div', { class: 'gate-status' });
   left.appendChild(status);
 
-  if (gateTransport.live && (readToken() ?? memoryToken) === null) {
-    renderTokenRow(left, () => {
-      say('Token held for this tab. The buttons will reach the server now.');
-    });
-  }
-
   const right = h('div', {});
   right.appendChild(h('span', { class: 'field-label' }, ['How the figure adds up']));
   const rows = gate.breakdown.map((line) =>
@@ -870,31 +883,60 @@ function renderGateSentBack(ev: GateEvent): void {
 }
 
 /**
- * Asks for the operator token, once per tab.
+ * Asks for the operator key, once per tab, in the footer.
  *
- * Rendered in the gate card rather than at page load, so a console that is
- * only being watched never asks for a credential it does not need. Deciding
- * a gate needs one; watching a call does not.
+ * It used to live inside the gate card, which put the words
+ * TELEPHONY_SHARED_SECRET on screen at the one moment everybody is looking
+ * at the money. A credential prompt is setup, not part of an approval: the
+ * operator sets it when they open the console and never sees it again.
+ *
+ * Three rules hold it there. It only renders in live mode, because watching
+ * a call needs no credential. It never renders when a key is already held.
+ * And once one is saved the control removes itself for the life of the tab,
+ * so it cannot reappear over a call.
  */
-function renderTokenRow(parent: HTMLElement, onStored: () => void): void {
-  const row = h('div', { class: 'gate-token' });
-  row.appendChild(h('span', { class: 'field-label' }, ['Operator token, to decide a gate']));
+function mountKeyControl(): void {
+  const slot = el('key-slot');
+  slot.replaceChildren();
+  if (!gateTransport.live) return;
+  if ((readToken() ?? memoryToken) !== null) return;
+
+  const open = h('button', { class: 'key-link' }, ['Set operator key']);
+  const form = h('div', { class: 'key-form' });
+  form.hidden = true;
   const input = h('input', {
-    class: 'gate-token-input mono',
+    class: 'key-input',
     type: 'password',
-    placeholder: 'TELEPHONY_SHARED_SECRET from .env.local',
+    placeholder: 'Paste the operator key',
     autocomplete: 'off',
+    'aria-label': 'Operator key',
   });
-  const save = h('button', { class: 'btn' }, ['Hold for this tab']);
-  save.addEventListener('click', () => {
+  const save = h('button', { class: 'key-save' }, ['Save']);
+
+  const store = (): void => {
     const value = input.value.trim();
     if (value === '') return;
     writeToken(value);
     input.value = '';
-    onStored();
+    // Gone for this tab. Not hidden, removed.
+    slot.replaceChildren(h('span', { class: 'key-done' }, ['Operator key held for this tab']));
+    setTimeout(() => slot.replaceChildren(), 4000);
+  };
+
+  open.addEventListener('click', () => {
+    form.hidden = false;
+    open.hidden = true;
+    input.focus();
   });
-  row.appendChild(h('div', { class: 'gate-token-row' }, [input, save]));
-  parent.appendChild(row);
+  save.addEventListener('click', store);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') store();
+  });
+
+  form.appendChild(input);
+  form.appendChild(save);
+  slot.appendChild(open);
+  slot.appendChild(form);
 }
 
 function logDecision(t: number, words: string): void {
@@ -1276,6 +1318,7 @@ function main(): void {
   // A real caller is on the line, so a click has to reach the process holding
   // them. The outcome comes back on this same stream.
   gateTransport = liveTransport;
+  mountKeyControl();
   startLive(liveUrl);
 }
 

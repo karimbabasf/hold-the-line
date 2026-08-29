@@ -549,20 +549,56 @@
   .gate-status { min-height: 17px; font-size: 13px; color: var(--muted); }
   .gate-status--bad { color: var(--alarm); }
 
-  .gate-token { display: flex; flex-direction: column; gap: 6px; }
-  .gate-token-row { display: flex; gap: var(--sp-2); align-items: center; }
-  .gate-token-input {
-    flex: 1;
-    padding: 10px 12px;
+  /* ------------------------------------------------- the operator key
+     Setup, not part of an approval. It lives in the footer, it is only
+     there in live mode with no key held, and it removes itself once one
+     is saved. It is never inside the gate card. */
+
+  .key-slot { display: inline-flex; align-items: center; gap: var(--sp-2); }
+
+  .key-link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 12.5px;
+    color: var(--faint);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    transition: color 160ms ease;
+  }
+  .key-link:hover { color: var(--muted); }
+  .key-link:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  .key-form { display: flex; gap: 6px; align-items: center; }
+  .key-form[hidden] { display: none; }
+  .key-input {
+    width: 210px;
+    padding: 5px 9px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--line);
     background: var(--ink);
     color: var(--paper);
     font: inherit;
-    font-size: 14px;
+    font-size: 12.5px;
   }
-  .gate-token-input::placeholder { color: var(--faint); }
-  .gate-token-input:focus { outline: none; border-color: var(--amber); }
+  .key-input::placeholder { color: var(--faint); }
+  .key-input:focus { outline: none; border-color: var(--amber); }
+  .key-save {
+    padding: 5px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line);
+    background: var(--ink-3);
+    color: var(--paper);
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: transform 140ms var(--ease-out), border-color 160ms ease;
+  }
+  .key-save:active { transform: scale(0.97); }
+  .key-save:hover { border-color: var(--muted); }
+  .key-done { font-size: 12.5px; color: var(--muted); }
 
   /* --------------------------------------------------------------- footer */
 
@@ -673,6 +709,7 @@
 <footer class="footer">
   <span id="counter-numbers" class="footer-note">No numbers said yet.</span>
   <span id="counter-utterances" class="footer-note">No binding sentences yet.</span>
+  <span id="key-slot" class="key-slot"></span>
   <span id="harness" class="harness">Starting up</span>
 </footer>
 
