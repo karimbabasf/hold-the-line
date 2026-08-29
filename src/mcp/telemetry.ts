@@ -236,6 +236,14 @@ export function numbersFrom(tool: string, result: unknown, runId: string): Numbe
       if (validity !== null) {
         out.push(record('Offer validity', validity, 'state_rules.json:offer_validity_days', 'days'));
       }
+      // The agent says this one out loud when a caller challenges a comp, and
+      // speech.ts has a rule for reading it ("0 point 0 8 5 dollars") for that
+      // reason. A figure the agent speaks with no source behind it shows red
+      // on the console, so it needs one.
+      const rate = num(r, 'mileage_adjustment_per_mile');
+      if (rate !== null) {
+        out.push(record('Mileage adjustment', rate, 'state_rules.json:mileage_adjustment_per_mile', 'usd'));
+      }
       return out;
     }
 

@@ -28,40 +28,70 @@ export interface SpokenNumber {
 }
 
 const NUM = String.raw`\d[\d,]*(?:\.\d+)?`;
+/** A fraction the shaper has spelled out, "0 8 5", or left joined, "6". */
+const FRACTION = String.raw`\d(?:\s\d)*`;
 
 /**
- * Alternation order is the whole design here. "13,481 dollars and 12 cents"
- * has to be read as one figure, so that branch comes before the plain
- * dollars branch, which comes before the bare-number branch that would
- * otherwise swallow the 13,481 on its own.
+ * Alternation order is the whole design here, and every branch below exists
+ * because `speech.ts` writes a figure that way.
+ *
+ * "0 point 0 8 5 dollars" comes first, or the plain dollars branch reads the
+ * tail of it as five dollars and the rate is lost. "13,481 dollars and 12
+ * cents" comes before the plain dollars branch for the same reason. Both come
+ * before the bare-number branch, which would otherwise swallow the whole part
+ * of either on its own.
  */
 const TOKEN = new RegExp(
   [
-    String.raw`\$\s?(${NUM})`,
+    String.raw`(${NUM})\s+point\s+(${FRACTION})\s+dollars?`,
     String.raw`(${NUM})\s+dollars?\s+and\s+(\d{1,2})\s+cents?`,
+    String.raw`\$\s?(${NUM})`,
     String.raw`(${NUM})\s+dollars?`,
     String.raw`(${NUM})\s+cents?`,
+    String.raw`(${NUM})\s+point\s+(${FRACTION})`,
     String.raw`(${NUM})`,
   ].join('|'),
   'gi',
 );
 
+/** A date is never a figure this reports, and its parts collide with real
+ *  ones: "2026-10-02" offers a 10 that a days ledger entry would match. */
+const ISO_DATE = /\d{4}-\d{2}-\d{2}/g;
+
 function toNumber(raw: string): number {
   return Number(raw.replace(/,/g, ''));
 }
 
+/** Puts a spelled fraction back together: "0 8 5" and "085" are one number. */
+function withFraction(whole: string, fraction: string): number {
+  return Number(`${whole.replace(/,/g, '')}.${fraction.replace(/\s/g, '')}`);
+}
+
 export function extractSpokenNumbers(text: string): SpokenNumber[] {
   const out: SpokenNumber[] = [];
-  for (const m of text.matchAll(TOKEN)) {
-    const [, dollarSign, dollarsPart, centsPart, dollarsOnly, centsOnly, bare] = m;
-    if (dollarSign !== undefined) {
-      out.push({ value: toNumber(dollarSign), money: true });
+  for (const m of text.replace(ISO_DATE, ' ').matchAll(TOKEN)) {
+    const [
+      ,
+      rateWhole, rateFraction,
+      dollarsPart, centsPart,
+      dollarSign,
+      dollarsOnly,
+      centsOnly,
+      decimalWhole, decimalFraction,
+      bare,
+    ] = m;
+    if (rateWhole !== undefined && rateFraction !== undefined) {
+      out.push({ value: withFraction(rateWhole, rateFraction), money: true });
     } else if (dollarsPart !== undefined && centsPart !== undefined) {
       out.push({ value: toNumber(dollarsPart) + Number(centsPart) / 100, money: true });
+    } else if (dollarSign !== undefined) {
+      out.push({ value: toNumber(dollarSign), money: true });
     } else if (dollarsOnly !== undefined) {
       out.push({ value: toNumber(dollarsOnly), money: true });
     } else if (centsOnly !== undefined) {
       out.push({ value: Number(centsOnly) / 100, money: true });
+    } else if (decimalWhole !== undefined && decimalFraction !== undefined) {
+      out.push({ value: withFraction(decimalWhole, decimalFraction), money: false });
     } else if (bare !== undefined) {
       out.push({ value: toNumber(bare), money: false });
     }
