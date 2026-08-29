@@ -47,6 +47,7 @@ export interface BridgeOptions {
   awaitApproval?: (
     gate: ResolvedGate,
     callerId: string,
+    signal?: AbortSignal,
   ) => Promise<ApprovalDecision | null>;
   /** Called with every console event the bridge emits (call start, session
    *  resume). The server broadcasts these to SSE clients. */
@@ -326,6 +327,7 @@ export function createBridge(opts: BridgeOptions) {
     callerId: string,
     round: number,
     shaper: SpeechShaper,
+    signal?: AbortSignal,
   ): AsyncGenerator<TurnDelta> {
     const { binding, authorised } = amountsFor(callerId);
 
@@ -356,7 +358,7 @@ export function createBridge(opts: BridgeOptions) {
     const pending = (): boolean =>
       pendingEvents.length > 0 || parkedQuestion !== null;
 
-    for await (const event of opts.forge.streamTurn(sessionId, input)) {
+    for await (const event of opts.forge.streamTurn(sessionId, input, signal)) {
       if (isQuestionRequired(event)) {
         parkedQuestion = event;
         // Whatever was mid-message goes no further, same as a gate: the
@@ -465,7 +467,7 @@ export function createBridge(opts: BridgeOptions) {
     // with nothing yet listening for its answer, so deciding the second of
     // two gates was dropped and that gate then hung. Found by Qodo.
     const decisions = opts.awaitApproval
-      ? gates.map((gate) => opts.awaitApproval!(gate, callerId))
+      ? gates.map((gate) => opts.awaitApproval!(gate, callerId, signal))
       : [];
     for (const gate of gates) opts.onApprovalRequired?.(gate, callerId);
 
@@ -499,13 +501,17 @@ export function createBridge(opts: BridgeOptions) {
       });
     });
 
-    yield* runGuarded(sessionId, resumeInput, callerId, round + 1, shaper);
+    yield* runGuarded(sessionId, resumeInput, callerId, round + 1, shaper, signal);
   }
 
   return {
     sessions,
     wasResumed,
-    async *runTurn(userText: string, callerId: string): AsyncGenerator<TurnDelta> {
+    async *runTurn(
+      userText: string,
+      callerId: string,
+      signal?: AbortSignal,
+    ): AsyncGenerator<TurnDelta> {
       const { id: sessionId, resumed, isNew } = await sessionFor(callerId);
 
       // Emit console events for session lifecycle changes.
@@ -561,6 +567,7 @@ export function createBridge(opts: BridgeOptions) {
           callerId,
           0,
           shaper,
+          signal,
         );
         const answeredTail = shaper.end();
         if (answeredTail) yield { type: 'message.delta', text: answeredTail };
@@ -589,6 +596,7 @@ export function createBridge(opts: BridgeOptions) {
         callerId,
         0,
         shaper,
+        signal,
       );
 
       const tail = shaper.end();

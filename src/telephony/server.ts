@@ -104,12 +104,35 @@ const bridge = createBridge({
         : { authorised_amounts: gate.authorised_amounts }),
     } satisfies ConsoleEvent);
   },
-  awaitApproval: (gate) =>
+  awaitApproval: (gate, callerId, signal) =>
     new Promise<ApprovalDecision | null>((settle) => {
       // Held until a human posts to /gate/decide. There is no timer here on
       // purpose: an operator who never decides leaves the caller hearing
       // nothing, which is the outcome this product exists to guarantee.
       waiting.set(gate.tool_call_id, settle);
+
+      // A hangup is not a decision, so this settles null, the same as an
+      // operator who never answered: nothing more is spoken. What it does
+      // change is that the waiter stops existing and the console stops
+      // showing a gate for a call that ended. Without it the promise is
+      // never settled at all and the entry never leaves the map.
+      if (!signal) return;
+      const gone = () => {
+        if (!waiting.has(gate.tool_call_id)) return;
+        console.log(`[gate] caller gone, dropping held gate ${gate.tool_call_id}`);
+        decideGate(gate.tool_call_id, null);
+        // The call ending is the truthful event here, not a new gate status:
+        // the gate was neither approved nor sent back, there is simply no
+        // longer a caller to say anything to.
+        broadcast({
+          type: 'call',
+          t: Date.now() - currentCallStart,
+          status: 'ended',
+          caller: callerId,
+        } satisfies ConsoleEvent);
+      };
+      if (signal.aborted) gone();
+      else signal.addEventListener('abort', gone, { once: true });
     }),
   onConsoleEvent: (event) => {
     if (event.type === 'call' && event.status === 'started') {
@@ -121,14 +144,29 @@ const bridge = createBridge({
 
 const chat = createChatEndpoint({ runTurn: bridge.runTurn });
 
-function toRequest(req: IncomingMessage, body: string): Request {
+/**
+ * Wraps a Node request as a Fetch Request, carrying the hangup with it.
+ *
+ * The signal is the point. Without it the endpoint has no way to learn the
+ * socket closed, so a turn parked on a gate waits on a promise for a caller
+ * who has already hung up: the waiter never settles and the console keeps
+ * showing a gate for a call that ended. `close` on the response with nothing
+ * finished is the socket going away, which on a phone line is the call
+ * ending mid-sentence.
+ */
+function toRequest(req: IncomingMessage, res: ServerResponse, body: string): Request {
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
     if (typeof v === 'string') headers.set(k, v);
   }
+  const gone = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) gone.abort(new Error('client closed the connection'));
+  });
   return new Request(`http://localhost:${PORT}${req.url ?? '/'}`, {
     method: req.method ?? 'GET',
     headers,
+    signal: gone.signal,
     ...(req.method === 'GET' || req.method === 'HEAD' ? {} : { body }),
   });
 }
@@ -285,15 +323,38 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
         return;
       }
 
-      const response = await chat(toRequest(req, Buffer.concat(chunks).toString('utf8')));
+      const response = await chat(
+        toRequest(req, res, Buffer.concat(chunks).toString('utf8')),
+      );
 
       res.writeHead(response.status, Object.fromEntries(response.headers));
       if (!response.body) {
         res.end();
         return;
       }
-      for await (const piece of response.body as unknown as AsyncIterable<Uint8Array>) {
-        res.write(piece);
+      // Read rather than for-await, so a socket that has gone away stops the
+      // loop and cancels the stream instead of writing into nothing for the
+      // rest of the turn.
+      const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+      // Cancelling the reader is what actually reaches the turn. The signal on
+      // the Request is a follower of the controller above and does not
+      // reliably fire once the request object is no longer referenced, which
+      // showed up live as a gate that stayed held after the caller hung up.
+      // This path is direct: socket closed, stream cancelled, turn told.
+      res.on('close', () => {
+        if (!res.writableFinished) {
+          void reader.cancel(new Error('client closed the connection')).catch(() => {});
+        }
+      });
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (res.writableEnded || res.destroyed) break;
+          res.write(value);
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
       }
       res.end();
     })();

@@ -18,8 +18,19 @@ export interface TurnDelta {
 }
 
 export interface ChatEndpointDeps {
-  /** Runs one caller utterance through the harness and streams back text. */
-  runTurn: (userText: string, callerId: string) => AsyncIterable<TurnDelta>;
+  /**
+   * Runs one caller utterance through the harness and streams back text.
+   *
+   * `signal` aborts when the caller is gone. A turn parked on an approval is
+   * waiting on a promise only an operator settles, so without this it waits
+   * for a caller who has already hung up: the waiter leaks and the console
+   * keeps showing a gate for a call that ended.
+   */
+  runTurn: (
+    userText: string,
+    callerId: string,
+    signal?: AbortSignal,
+  ) => AsyncIterable<TurnDelta>;
 }
 
 interface ChatMessage {
@@ -53,12 +64,38 @@ export function createChatEndpoint(
     // cannot be matched to its checkpoint, so it degrades rather than throws.
     const callerId = typeof body.user === 'string' ? body.user : 'unknown';
 
+    // The caller is gone when either the request is aborted or the response
+    // body is cancelled. Telnyx does the second: it stops reading. Both are
+    // funnelled into one signal so a turn has a single thing to listen to.
+    const hangup = new AbortController();
+    const giveUp = (why: string) => {
+      if (!hangup.signal.aborted) hangup.abort(new Error(why));
+    };
+    if (req.signal.aborted) {
+      // 499 rather than 200: nothing was streamed, so this can still be a
+      // status, and opening a harness turn for a caller who has already gone
+      // costs a session and a model call for nobody.
+      return json({ error: 'caller hung up before the turn started' }, 499);
+    }
+    req.signal.addEventListener('abort', () => giveUp('request aborted'));
+
+    // Set once the stream is gone, so the rest of a turn that is still
+    // unwinding does not throw trying to speak into it.
+    let shut = false;
+
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const encoder = new TextEncoder();
-        const send = (s: string) => controller.enqueue(encoder.encode(s));
+        const send = (s: string) => {
+          if (shut) return;
+          try {
+            controller.enqueue(encoder.encode(s));
+          } catch {
+            shut = true;
+          }
+        };
         try {
-          for await (const delta of deps.runTurn(userText, callerId)) {
+          for await (const delta of deps.runTurn(userText, callerId, hangup.signal)) {
             if (delta.type === 'message.delta' && delta.text) {
               send(chunk({ content: delta.text }));
             }
@@ -78,8 +115,26 @@ export function createChatEndpoint(
           console.error('runTurn failed mid-stream:', err);
         } finally {
           send('data: [DONE]\n\n');
-          controller.close();
+          if (!shut) {
+            shut = true;
+            try {
+              controller.close();
+            } catch {
+              // Already closed by a cancel. Nothing to do.
+            }
+          }
+          // The turn is over either way, so nothing should still be waiting
+          // on its behalf.
+          giveUp('turn finished');
         }
+      },
+      cancel(reason) {
+        // The consumer stopped reading. On a phone line that is the call
+        // ending mid-sentence, and it is the signal that actually arrives:
+        // the socket close is noticed by the server, which cancels this
+        // stream. See server.ts.
+        shut = true;
+        giveUp(`response cancelled: ${String(reason ?? 'no reason given')}`);
       },
     });
 
