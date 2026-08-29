@@ -205,8 +205,12 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   req.on('end', () => {
     if (tooLarge) return;
     void (async () => {
-      const url = req.url ?? '/';
-      console.log(`${req.method} ${url}`);
+      const raw = req.url ?? '/';
+      // Route on the path alone. `req.url` carries the query string, so
+      // comparing it directly sent every documented console mode
+      // (?demo, ?speed, ?until, ?live) down the 404 branch.
+      const url = raw.split('?')[0] ?? '/';
+      console.log(`${req.method} ${raw}`);
 
       if (url === '/sse') {
         res.writeHead(200, {
@@ -312,7 +316,9 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
         return;
       }
 
-      if (!url.startsWith('/v1/chat/completions')) {
+      // Exact, not a prefix: the query string is already stripped above, so a
+      // prefix match let paths under this one through to the chat handler.
+      if (url !== '/v1/chat/completions') {
         res.writeHead(404).end('not found');
         return;
       }
