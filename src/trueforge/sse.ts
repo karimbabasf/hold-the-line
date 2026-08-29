@@ -33,8 +33,10 @@ export async function* parseSse(
 
       buffer += decoder.decode(value, { stream: true });
 
-      // Normalise CRLF so the frame delimiter check stays single-form.
-      buffer = buffer.replace(/\r\n/g, '\n');
+      // The SSE spec allows CRLF, LF and a LONE CR as line terminators.
+      // Normalising only CRLF loses every frame on a CR-only stream, so both
+      // are folded to LF before the delimiter search.
+      buffer = buffer.replace(/\r\n?/g, '\n');
 
       let sep = buffer.indexOf('\n\n');
       while (sep !== -1) {

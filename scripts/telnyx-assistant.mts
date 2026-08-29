@@ -50,18 +50,30 @@ async function findOurs() {
   return rows.find((a) => a['name'] === ASSISTANT_NAME) ?? null;
 }
 
-/** Telnyx requires an api_key_ref even when the endpoint does not check it,
- *  so a placeholder secret is registered once. */
+/**
+ * Registers the bearer token Telnyx presents to our endpoint.
+ *
+ * This is the same value the server checks as TELEPHONY_SHARED_SECRET, so it
+ * comes from the environment. It was briefly a fixed placeholder string in
+ * this file, which made the public endpoint effectively unauthenticated to
+ * anyone reading the repo.
+ */
 async function ensureSecret() {
+  const token = process.env.TELEPHONY_SHARED_SECRET;
+  if (!token) throw new Error('TELEPHONY_SHARED_SECRET is not set');
+
   const list = await api('GET', '/integration_secrets?page[size]=50');
   const rows = (list['data'] ?? []) as Array<Record<string, unknown>>;
-  if (rows.some((s) => s['identifier'] === SECRET_ID)) return;
+  const existing = rows.find((s) => s['identifier'] === SECRET_ID);
+  if (existing) {
+    await api('DELETE', `/integration_secrets/${String(existing['id'])}`);
+  }
   await api('POST', '/integration_secrets', {
     identifier: SECRET_ID,
     type: 'bearer',
-    token: 'unused-local-endpoint-does-not-authenticate',
+    token,
   });
-  console.log(`created integration secret ${SECRET_ID}`);
+  console.log(`registered integration secret ${SECRET_ID}`);
 }
 
 /**

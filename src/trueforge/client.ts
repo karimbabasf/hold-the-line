@@ -24,9 +24,10 @@ export interface TrueForgeClientOptions {
 
 export class TrueForgeError extends Error {
   // Written out rather than declared as constructor parameter properties.
-  // Node's --experimental-strip-types removes types without emitting code,
-  // so `constructor(readonly status: number)` throws
-  // ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX at load time.
+  // Node's --experimental-strip-types removes types without emitting code, so
+  // `constructor(readonly status: number)` throws
+  // ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX at load time. It typechecks clean and
+  // crashes on import, which is why test/loadable.test.ts exists.
   readonly status: number;
   readonly body: string;
 
@@ -148,17 +149,35 @@ export class TrueForgeClient {
     body?: unknown,
     signal?: AbortSignal,
   ): Promise<Response> {
-    // A caller-supplied signal and our own timeout both have to be able to
-    // abort, so they are combined rather than one overriding the other.
-    const timeout = AbortSignal.timeout(this.timeoutMs);
-    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    // The timeout covers CONNECTING only, and is cleared the moment headers
+    // arrive.
+    //
+    // AbortSignal.timeout() stays live for the whole response lifetime,
+    // including the body. On an SSE turn that means the harness gets 30
+    // seconds total and then the stream dies mid-call, which is precisely the
+    // failure this project cannot have: a caller on hold while the agent is
+    // thinking. The caller's own signal stays attached, because a caller who
+    // hangs up should still cancel the turn.
+    const connectTimeout = new AbortController();
+    const timer = setTimeout(() => {
+      connectTimeout.abort(new Error(`no response within ${this.timeoutMs}ms`));
+    }, this.timeoutMs);
 
-    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
-      method,
-      headers: { 'content-type': 'application/json', accept: 'text/event-stream, application/json' },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: combined,
-    });
+    const combined = signal
+      ? AbortSignal.any([signal, connectTimeout.signal])
+      : connectTimeout.signal;
+
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method,
+        headers: { 'content-type': 'application/json', accept: 'text/event-stream, application/json' },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: combined,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');

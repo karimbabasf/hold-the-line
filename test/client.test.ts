@@ -36,13 +36,57 @@ test('a failed request carries the status and body', async () => {
 
 test('turn input may not mix user messages with approval resumes', async () => {
   const client = new TrueForgeClient({ fetchImpl: async () => new Response('{}') });
-  await assert.rejects(
-    async () => {
-      for await (const _ of client.streamTurn('s', [
-        { type: 'user.message', content: 'hi' },
-        { type: 'user.tool_approval', thread_id: 't', tool_call_id: 'c', approval: { status: 'allow' } },
-      ])) { /* consume */ }
-    },
-    /must not mix/,
-  );
+  await assert.rejects(async () => {
+    for await (const _event of client.streamTurn('s', [
+      { type: 'user.message', content: 'hi' },
+      {
+        type: 'user.tool_approval',
+        thread_id: 't',
+        tool_call_id: 'c',
+        approval: { status: 'allow' },
+      },
+    ])) {
+      /* consume */
+    }
+  }, /must not mix/);
+});
+
+test('the connect timeout does not abort an active stream body', async () => {
+  // AbortSignal.timeout() stays live for the whole response lifetime, so a
+  // 30s timeout killed SSE turns mid-call. Qodo confirmed this on PR 1 after
+  // I asked about it. The timeout now covers connecting only.
+  const client = new TrueForgeClient({
+    requestTimeoutMs: 30,
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const enc = new TextEncoder();
+            controller.enqueue(enc.encode('data: {"type":"a"}\n\n'));
+            // Outlive the 30ms timeout before sending anything more.
+            await new Promise((r) => setTimeout(r, 120));
+            controller.enqueue(enc.encode('data: {"type":"b"}\n\n'));
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ),
+  });
+
+  const seen: string[] = [];
+  for await (const event of client.streamTurn('s', [{ type: 'user.message', content: 'hi' }])) {
+    seen.push(event.type);
+  }
+  assert.deepEqual(seen, ['a', 'b']);
+});
+
+test('a request that never responds still times out', async () => {
+  const client = new TrueForgeClient({
+    requestTimeoutMs: 20,
+    fetchImpl: (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      }),
+  });
+  await assert.rejects(() => client.createSession('northvane'), /abort/i);
 });
