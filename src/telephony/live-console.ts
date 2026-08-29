@@ -97,6 +97,48 @@ function tokenMatches(header: string | undefined, secret: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * What one Telnyx TeXML status callback means for the screen.
+ *
+ * The callback is form encoded and mirrors Twilio's: `CallStatus`, `From`,
+ * `To`, `CallSid`. It is the only signal on this integration that arrives
+ * when the phone is answered rather than when the caller has finished a
+ * sentence, and the only one that arrives at all when a caller hangs up
+ * during silence. Both are what an operator watches the header for.
+ *
+ * Statuses are matched by name and anything unrecognised is ignored rather
+ * than guessed at: a status this does not know is not evidence a call
+ * started, and certainly not evidence one ended.
+ */
+export function readTelnyxStatus(body: string): {
+  kind: 'started' | 'ended' | 'ignore';
+  status: string;
+  caller?: string;
+} {
+  const form = new URLSearchParams(body);
+  const status = (form.get('CallStatus') ?? '').toLowerCase();
+  const from = form.get('From') ?? undefined;
+  const caller = from === undefined || from === '' ? {} : { caller: from };
+
+  // `ringing` is deliberately not a start. An inbound leg is ringing before
+  // anyone has answered it, and a header that says ON CALL for a phone that
+  // is still ringing is the same lie in the other direction.
+  if (status === 'in-progress' || status === 'answered') {
+    return { kind: 'started', status, ...caller };
+  }
+  if (
+    status === 'completed' ||
+    status === 'busy' ||
+    status === 'failed' ||
+    status === 'no-answer' ||
+    status === 'canceled' ||
+    status === 'cancelled'
+  ) {
+    return { kind: 'ended', status, ...caller };
+  }
+  return { kind: 'ignore', status, ...caller };
+}
+
 export function createLiveConsole(options: LiveConsoleOptions = {}) {
   const now = options.now ?? Date.now;
   const bufferLimit = options.bufferLimit ?? DEFAULT_BUFFER_LIMIT;
@@ -280,6 +322,50 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
       pendingEnd = null;
       callEnded(ended.caller);
     }
+  }
+
+  /**
+   * A caller is on the line. Idempotent, and callable before anyone knows
+   * who is calling.
+   *
+   * This exists because `call started` used to be reported by the bridge,
+   * which only reaches it after awaiting a harness session. Everything the
+   * console renders is anchored on that frame: `callerSaid` and
+   * `holdStarted` both queue themselves while `callStart` is null. So the
+   * screen stayed idle, and the caller's own first sentence stayed
+   * invisible, for the whole of a session round trip to TrueForge on the
+   * one turn where a watching operator has nothing else on screen.
+   *
+   * Two callers now reach it, and both are earlier than the bridge:
+   *
+   *   - the chat endpoint, the instant a turn arrives, and
+   *   - the Telnyx status callback, at answer, which is earlier still. The
+   *     line speaks a fixed greeting before it ever calls us, so without
+   *     the webhook the console cannot light up until the caller has
+   *     finished a sentence and it has been transcribed.
+   *
+   * `callerId` and `display` are separate because the webhook path has the
+   * caller's number but NOT the id the chat endpoint keys on: that comes
+   * out of Telnyx's own request body and is not a phone number. A call
+   * opened with no id leaves `currentCaller` null, which `ownsCall` reads
+   * as "anyone", and the first turn adopts the real id.
+   */
+  function callStarted(callerId?: string, display?: string): void {
+    const live = callStart !== null && !callOver;
+    if (live && (currentCaller === null || callerId === undefined || currentCaller === callerId)) {
+      if (currentCaller === null && callerId !== undefined) currentCaller = callerId;
+      return;
+    }
+    broadcast({
+      type: 'call',
+      t: 0,
+      status: 'started',
+      ...(display === undefined ? {} : { caller: display }),
+    } as ConsoleEvent);
+    // After the broadcast, which sets this from the frame's own `caller`.
+    // The id the turns carry is what ownership is checked against, and it is
+    // not always what the header shows.
+    currentCaller = callerId ?? null;
   }
 
   function emit(body: ConsoleEventBody, at?: number): void {
@@ -469,6 +555,7 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     holdStarted,
     holdStopped,
     callerSaid,
+    callStarted,
     callEnded,
     noteSpokenText,
     endSpokenTurn,

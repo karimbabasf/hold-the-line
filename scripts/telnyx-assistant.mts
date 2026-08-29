@@ -141,6 +141,59 @@ async function assignNumber(assistantId: string) {
 }
 
 /**
+ * Points the TeXML application's status callback at us.
+ *
+ * This is the only signal on the whole integration that arrives when the
+ * phone is answered rather than when the caller has finished a sentence, and
+ * the only one that arrives at all when a caller hangs up during silence.
+ * Without it the operator console cannot light up until Telnyx has spoken
+ * its greeting, heard a sentence and transcribed it, and it never learns
+ * that an ordinary call ended.
+ *
+ * The token rides in the query string because Telnyx sends this callback
+ * itself and there is nowhere to configure an Authorization header on it.
+ * It is the same shared secret the endpoint already checks, and the URL only
+ * ever exists inside this account.
+ */
+async function pointStatusCallback(assistantId: string, baseUrl: string) {
+  const token = process.env.TELEPHONY_SHARED_SECRET;
+  if (!token) throw new Error('TELEPHONY_SHARED_SECRET is not set');
+
+  const detail = await api('GET', `/ai/assistants/${assistantId}`);
+  const a = (detail['data'] ?? detail) as Record<string, unknown>;
+  const telephony = a['telephony_settings'] as Record<string, unknown> | undefined;
+  const appId = telephony?.['default_texml_app_id'];
+  if (!appId) {
+    console.warn('assistant has no default_texml_app_id yet, skipping the status callback');
+    return;
+  }
+  const url =
+    `${baseUrl.replace(/\/+$/, '')}/telnyx/status?k=${encodeURIComponent(token)}`;
+  // `friendly_name` and `voice_url` go along because the TeXML application
+  // update treats them as required and rejects a body without them, even
+  // when nothing about them is changing. They are copied off the read rather
+  // than reconstructed: this app is created by Telnyx for the assistant, and
+  // guessing its voice_url would point the number at nothing.
+  const current = await api('GET', `/texml_applications/${String(appId)}`);
+  const app = (current['data'] ?? current) as Record<string, unknown>;
+  await api('PATCH', `/texml_applications/${String(appId)}`, {
+    friendly_name: app['friendly_name'],
+    voice_url: app['voice_url'],
+    status_callback: url,
+    status_callback_method: 'post',
+  });
+
+  // Telnyx accepts unknown fields with a 200 and stores nothing, so the write
+  // is not evidence. Only the read is.
+  const back = await api('GET', `/texml_applications/${String(appId)}`);
+  const stored = (back['data'] as Record<string, unknown>)?.['status_callback'];
+  if (stored !== url) {
+    throw new Error(`status_callback did not stick: ${String(stored)}`);
+  }
+  console.log(`status callback -> ${baseUrl.replace(/\/+$/, '')}/telnyx/status`);
+}
+
+/**
  * Reads back what Telnyx actually stored.
  *
  * Telnyx accepts unknown fields with a 200 and stores nothing, so a write is
@@ -174,6 +227,7 @@ if (flag === '--show') {
   const id = String((created['data'] as Record<string, unknown>)?.['id'] ?? created['id']);
   console.log(`created assistant ${id}`);
   await assignNumber(id);
+  await pointStatusCallback(id, baseUrl);
   await verify(id);
 } else if (flag === '--point') {
   const ours = await findOurs();
@@ -196,6 +250,7 @@ if (flag === '--show') {
       model: 'hold-the-line',
     },
   });
+  await pointStatusCallback(String(ours['id']), arg);
   await verify(String(ours['id']));
   console.log(`pointed ${String(ours['id'])} at ${arg}/v1`);
 } else {

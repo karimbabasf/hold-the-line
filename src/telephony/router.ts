@@ -94,6 +94,15 @@ export interface RouterDeps {
     authorization: string | undefined,
     body: string,
   ) => { status: number; body: unknown };
+  /**
+   * The Telnyx TeXML status callback: the call was answered, or it ended.
+   *
+   * Authenticated on a query token rather than a header, because Telnyx
+   * sends this one itself and there is nowhere to configure an Authorization
+   * header for it. The token is the same shared secret, and it is only ever
+   * in a URL we hand to Telnyx.
+   */
+  telnyxStatus?: (body: string) => { status: number; body: unknown };
   /** Origin used to rebuild a Web Standard Request. Only the path and query
    *  matter downstream; this exists so the URL parses. */
   origin?: string;
@@ -193,6 +202,21 @@ export function createRouter(deps: RouterDeps) {
         return;
       }
       const result = deps.ingest(req.headers['authorization'], req.body);
+      sendJson(res, result.status, result.body);
+      return;
+    }
+
+    if (path === '/telnyx/status') {
+      if (!deps.telnyxStatus || req.method !== 'POST') {
+        sendJson(res, 404, { error: 'not found' });
+        return;
+      }
+      const token = new URLSearchParams((req.url || '').split('?')[1] ?? '').get('k');
+      if (!deps.secretMatches(token ?? undefined)) {
+        sendJson(res, 401, { error: 'unauthorized' });
+        return;
+      }
+      const result = deps.telnyxStatus(req.body);
       sendJson(res, result.status, result.body);
       return;
     }

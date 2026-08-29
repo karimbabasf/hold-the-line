@@ -345,3 +345,72 @@ test('a dead socket stops the write loop instead of writing into nothing', async
   assert.ok(!out.body.includes('data: two'), 'wrote into a socket that was already gone');
   assert.equal(out.ended, false, 'a dead socket was ended anyway');
 });
+
+/**
+ * The Telnyx status callback.
+ *
+ * This is the route that tells the console a phone was answered and, more
+ * importantly, that a caller hung up: Telnyx holds one request per turn and
+ * nothing in between, so an ordinary goodbye aborts nothing and the header
+ * used to read ON CALL over a dead line until somebody else rang.
+ *
+ * It authenticates on a query token because Telnyx sends the callback itself
+ * and there is nowhere to configure a header on it.
+ */
+test('the Telnyx status callback reaches the handler with a good token', async () => {
+  const seen: string[] = [];
+  const handle = createRouter(
+    deps({
+      secretMatches: (v) => v === 'sekret',
+      telnyxStatus: (body) => {
+        seen.push(body);
+        return { status: 200, body: { ok: true } };
+      },
+    }),
+  );
+  const { res, out } = recorder();
+
+  await handle(
+    request({
+      method: 'POST',
+      url: '/telnyx/status?k=sekret',
+      body: 'CallStatus=completed&From=%2B14155550101',
+    }),
+    res,
+  );
+
+  assert.equal(out.status, 200);
+  assert.deepEqual(seen, ['CallStatus=completed&From=%2B14155550101']);
+});
+
+test('the status callback is rejected without the token', async () => {
+  let called = false;
+  const handle = createRouter(
+    deps({
+      secretMatches: (v) => v === 'sekret',
+      telnyxStatus: () => {
+        called = true;
+        return { status: 200, body: { ok: true } };
+      },
+    }),
+  );
+
+  for (const url of ['/telnyx/status', '/telnyx/status?k=wrong']) {
+    const { res, out } = recorder();
+    await handle(request({ method: 'POST', url, body: 'CallStatus=completed' }), res);
+    assert.equal(out.status, 401, `${url} was not rejected`);
+  }
+  assert.equal(called, false, 'an unauthenticated callback reached the handler');
+});
+
+test('the status route 404s when it is not wired, and on the wrong method', async () => {
+  const unwired = createRouter(deps());
+  const a = recorder();
+  await unwired(request({ method: 'POST', url: '/telnyx/status?k=x' }), a.res);
+  assert.equal(a.out.status, 404);
+
+  const wired = createRouter(deps({ telnyxStatus: () => ({ status: 200, body: {} }) }));
+  const b = recorder();
+  await wired(request({ method: 'GET', url: '/telnyx/status?k=x' }), b.res);
+  assert.equal(b.out.status, 404);
+});

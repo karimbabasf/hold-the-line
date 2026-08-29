@@ -14,7 +14,7 @@ import { TrueForgeClient } from '../trueforge/client.ts';
 import type { ApprovalDecision, ResolvedGate } from '../trueforge/types.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
 import { createBridge } from './harness-bridge.ts';
-import { createLiveConsole } from './live-console.ts';
+import { createLiveConsole, readTelnyxStatus } from './live-console.ts';
 import { createNodeHandler, createRouter } from './router.ts';
 
 /**
@@ -119,8 +119,51 @@ const bridge = createBridge({
       if (signal.aborted) gone();
       else signal.addEventListener('abort', gone, { once: true });
     }),
-  onConsoleEvent: (event) => { live.broadcast(event); },
+  onConsoleEvent: (event) => {
+    // The bridge reports the call once its harness session exists. By then
+    // the console has been showing it since the first request landed, so this
+    // goes through the idempotent path rather than straight to `broadcast`: a
+    // second raw `call started` empties the replay buffer and re-anchors the
+    // call clock in the middle of a live call.
+    if (event.type === 'call' && event.status === 'started') live.callStarted(event.caller);
+    else live.broadcast(event);
+  },
 });
+
+/**
+ * The backstop end-of-call.
+ *
+ * The honest end-of-call signal on this path is the caller's socket going
+ * away mid-turn, and that only exists while a turn is open. Telnyx holds one
+ * request per turn and nothing in between, so a caller who says goodbye and
+ * hangs up in the silence after the agent finished aborts nothing: the
+ * console showed ON CALL for a dead line until the next call. The Telnyx
+ * status callback is the real fix and fires in about a second; this is here
+ * for the case where it does not fire at all.
+ *
+ * Long on purpose. A caller reading their paperwork is not a caller who
+ * hung up, and ending the call on screen under someone still on the line is
+ * worse than ending it late.
+ */
+const IDLE_END_MS = 45_000;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function disarmIdleEnd(): void {
+  if (idleTimer === null) return;
+  clearTimeout(idleTimer);
+  idleTimer = null;
+}
+
+function armIdleEnd(callerId: string): void {
+  disarmIdleEnd();
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    console.log(`[call] no turn from ${callerId} in ${IDLE_END_MS}ms, treating the call as over`);
+    live.callEnded(callerId);
+  }, IDLE_END_MS);
+  // Nothing should be kept alive waiting to declare a call over.
+  idleTimer.unref?.();
+}
 
 /**
  * Wraps a turn so the console learns three things only this process knows.
@@ -148,6 +191,13 @@ const bridge = createBridge({
  * is on screen cannot fold their hold time or their figures into it.
  */
 async function* observedTurn(userText: string, callerId: string, signal?: AbortSignal) {
+  disarmIdleEnd();
+  // Before anything is awaited. This process knows a call is happening the
+  // moment a turn arrives, and the bridge does not know it until a harness
+  // session exists; putting the console's anchor behind that round trip was
+  // what left the screen idle, and the caller's own words queued, through
+  // the one part of the call an operator is watching hardest.
+  live.callStarted(callerId, callerId);
   live.callerSaid(userText, callerId);
   live.holdStarted(callerId);
   try {
@@ -168,6 +218,8 @@ async function* observedTurn(userText: string, callerId: string, signal?: AbortS
   } finally {
     live.holdStopped(callerId);
     live.endSpokenTurn(callerId);
+    // The turn is over, which is not the call being over. Start counting.
+    if (live.onCall()) armIdleEnd(callerId);
   }
 }
 
@@ -177,6 +229,7 @@ const chat = createChatEndpoint({
   // path. See the note on `onCallerGone`.
   onCallerGone: (callerId) => {
     console.log(`[call] ${callerId} is gone`);
+    disarmIdleEnd();
     live.callEnded(callerId);
     // The physical call is over, so the fast-path session is not live any
     // more. The disk checkpoint still carries the conversation, so the same
@@ -372,6 +425,20 @@ const handle = createRouter({
     decide: decideFromBody,
   },
   ingest: (authorization, body) => live.ingest(authorization, body),
+  telnyxStatus: (body) => {
+    const ev = readTelnyxStatus(body);
+    console.log(`[telnyx] call status ${ev.status || '(none)'}`);
+    if (ev.kind === 'started') {
+      // No caller id. The id every turn is keyed on comes out of Telnyx's
+      // request body and is not a phone number, so this opens the call with
+      // the number on the header and no owner, and the first turn adopts it.
+      live.callStarted(undefined, ev.caller);
+    } else if (ev.kind === 'ended') {
+      disarmIdleEnd();
+      live.callEnded();
+    }
+    return { status: 200, body: { ok: true } };
+  },
 });
 
 const server = createServer(
