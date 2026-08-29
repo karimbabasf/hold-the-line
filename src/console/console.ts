@@ -321,8 +321,14 @@ function renderGateOpen(gate: GateState): void {
   textarea.addEventListener('input', () => {
     renderDiff();
     const unedited = textarea.value === gate.wanted;
-    btnApprove.classList.toggle('is-inactive', !unedited);
-    btnApproveEdits.classList.toggle('is-inactive', unedited);
+    const empty = textarea.value.trim() === '';
+    btnApprove.classList.toggle('is-inactive', !unedited || empty);
+    btnApproveEdits.classList.toggle('is-inactive', unedited || empty);
+    // An emptied draft cannot be approved by either path: there is nothing
+    // left to speak, and a blank binding utterance is not a smaller version
+    // of the offer, it is a different failure than the one this button row
+    // already guards against.
+    btnSendBack.classList.toggle('is-emphasised', empty);
   });
 
   // This is a replay of a recorded call, not a live backend: these buttons
