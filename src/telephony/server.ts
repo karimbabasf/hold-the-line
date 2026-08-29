@@ -6,16 +6,16 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { encodeSSE, type ConsoleEvent } from '../console/events.ts';
 import { TrueForgeClient } from '../trueforge/client.ts';
 import type { ApprovalDecision, ResolvedGate } from '../trueforge/types.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
 import { createBridge } from './harness-bridge.ts';
-import { createRouter, type RouteResponse } from './router.ts';
+import { createLiveConsole } from './live-console.ts';
+import { createNodeHandler, createRouter } from './router.ts';
 
 /**
  * The endpoint is on a public tunnel, so it authenticates.
@@ -41,17 +41,16 @@ const PORT = Number(process.env.PORT ?? 8791);
 const AGENT_NAME = process.env.TRUEFORGE_AGENT ?? 'northvane';
 const TRUEFORGE_BASE_URL = process.env.TRUEFORGE_BASE_URL ?? 'http://localhost:8790';
 
-const sseClients = new Set<RouteResponse>();
-let sseSeq = 0;
-
-function broadcast(event: ConsoleEvent): void {
-  const frame = encodeSSE(event, sseSeq++);
-  for (const client of sseClients) {
-    client.write(frame);
-  }
-}
-
-let currentCallStart = Date.now();
+/**
+ * The console's live end.
+ *
+ * `CONSOLE_INGEST_SECRET` is what the tool process on 8792 presents to write
+ * events onto an operator's screen. It is required, not optional: this
+ * listener is on a public tunnel, so an open ingest route would let anyone
+ * who found the tunnel put whatever figures they liked in front of an
+ * adjuster. `scripts/start.sh` generates one and hands it to both processes.
+ */
+const live = createLiveConsole({ ingestSecret: process.env.CONSOLE_INGEST_SECRET });
 
 /**
  * Gates the bridge is holding, and the promises waiting on them.
@@ -81,9 +80,8 @@ const bridge = createBridge({
   onApprovalRequired: (gate, _callerId) => {
     console.log(`[gate] approval required: ${gate.tool} ${gate.tool_call_id}`);
     pendingGates.set(gate.tool_call_id, gate);
-    broadcast({
+    live.emit({
       type: 'gate',
-      t: Date.now() - currentCallStart,
       id: gate.tool_call_id,
       tool: gate.tool,
       status: 'opened',
@@ -92,7 +90,7 @@ const bridge = createBridge({
       ...(gate.authorised_amounts === undefined
         ? {}
         : { authorised_amounts: gate.authorised_amounts }),
-    } satisfies ConsoleEvent);
+    });
   },
   awaitApproval: (gate, callerId, signal) =>
     new Promise<ApprovalDecision | null>((settle) => {
@@ -114,25 +112,49 @@ const bridge = createBridge({
         // The call ending is the truthful event here, not a new gate status:
         // the gate was neither approved nor sent back, there is simply no
         // longer a caller to say anything to.
-        broadcast({
-          type: 'call',
-          t: Date.now() - currentCallStart,
-          status: 'ended',
-          caller: callerId,
-        } satisfies ConsoleEvent);
+        // The live console stamps `t` off its own call clock, which is the
+        // only one that knows when this call was answered.
+        live.emit({ type: 'call', status: 'ended', caller: callerId });
       };
       if (signal.aborted) gone();
       else signal.addEventListener('abort', gone, { once: true });
     }),
-  onConsoleEvent: (event) => {
-    if (event.type === 'call' && event.status === 'started') {
-      currentCallStart = Date.now();
-    }
-    broadcast(event);
-  },
+  onConsoleEvent: (event) => { live.broadcast(event); },
 });
 
-const chat = createChatEndpoint({ runTurn: bridge.runTurn });
+/**
+ * Wraps a turn so the console learns two things only this process knows.
+ *
+ * Hold is the dead air between a caller finishing a sentence and hearing the
+ * first word back. That is the real thing an operator watches, and it is
+ * exactly this span, so it is measured here rather than guessed at from tool
+ * activity.
+ *
+ * The text is buffered and read at the end of the turn for the numbers in it.
+ * The tool process reports what it computed, but it has no idea which of
+ * those figures reached the caller's ear, and "numbers spoken" has to mean
+ * spoken. A figure that matches one a tool reported is tagged with that
+ * tool's provenance; a money figure that matches nothing is reported with no
+ * provenance at all, which the console renders red. That is the failure this
+ * project exists to make visible, so it is never given a default.
+ */
+async function* observedTurn(userText: string, callerId: string) {
+  live.holdStarted();
+  try {
+    for await (const delta of bridge.runTurn(userText, callerId)) {
+      if (delta.text) {
+        live.holdStopped();
+        live.noteSpokenText(delta.text);
+      }
+      yield delta;
+    }
+  } finally {
+    live.holdStopped();
+    live.endSpokenTurn();
+  }
+}
+
+const chat = createChatEndpoint({ runTurn: observedTurn });
 
 /**
  * One decision on one held gate, from a request body.
@@ -184,85 +206,23 @@ const handle = createRouter({
   agentName: AGENT_NAME,
   origin: `http://localhost:${PORT}`,
   sse: {
-    attach: (sink) => { sseClients.add(sink); },
-    detach: (sink) => { sseClients.delete(sink); },
+    attach: (sink, lastEventId) => { live.attach(sink, lastEventId); },
+    detach: (sink) => { live.detach(sink); },
   },
   gate: {
     pending: () => [...pendingGates.values()],
     decide: decideFromBody,
   },
+  ingest: (authorization, body) => live.ingest(authorization, body),
 });
 
-const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-  const chunks: Buffer[] = [];
-  let received = 0;
-  let tooLarge = false;
-
-  req.on('data', (c: Buffer) => {
-    received += c.length;
-    if (received > MAX_BODY_BYTES) {
-      if (!tooLarge) {
-        tooLarge = true;
-        res.writeHead(413, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'request body too large' }));
-        req.destroy();
-      }
-      return;
-    }
-    chunks.push(c);
-  });
-
-  req.on('end', () => {
-    if (tooLarge) return;
-    const raw = req.url ?? '/';
-    console.log(`${req.method} ${raw}`);
-
-    const headers: Record<string, string | undefined> = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      headers[k] = typeof v === 'string' ? v : Array.isArray(v) ? v[0] : undefined;
-    }
-
-    // The socket closing before the response finished is the caller hanging
-    // up. Latched, because a listener registered after that has happened
-    // still has to run: the chat route adds one after awaiting the harness.
-    let aborted = false;
-    const abortListeners: Array<() => void> = [];
-    res.on('close', () => {
-      if (res.writableFinished) return;
-      aborted = true;
-      for (const fn of abortListeners.splice(0)) fn();
-    });
-
-    // One sink per request, so its identity is stable: the SSE hub keys a
-    // live client on it.
-    const sink: RouteResponse = {
-      writeHead: (status, h) => { res.writeHead(status, h ?? {}); },
-      write: (chunk) => { res.write(chunk); },
-      end: (chunk) => { chunk === undefined ? res.end() : res.end(chunk); },
-      writable: () => !res.writableEnded && !res.destroyed,
-    };
-
-    void handle(
-      {
-        method: req.method ?? 'GET',
-        url: raw,
-        headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-        onClose: (fn) => { res.on('close', fn); },
-        onAborted: (fn) => { if (aborted) fn(); else abortListeners.push(fn); },
-      },
-      sink,
-    ).catch((err: unknown) => {
-      console.error('request handling failed:', err);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'internal error' }));
-        return;
-      }
-      res.destroy();
-    });
-  });
-});
+const server = createServer(
+  createNodeHandler({
+    handle,
+    maxBodyBytes: MAX_BODY_BYTES,
+    onRequest: (method, url) => { console.log(`${method} ${url}`); },
+  }),
+);
 
 server.listen(PORT, () => {
   console.log(`hold-the-line telephony on http://localhost:${PORT}`);

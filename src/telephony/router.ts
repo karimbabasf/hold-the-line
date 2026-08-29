@@ -14,6 +14,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { stripTypeScriptTypes } from 'node:module';
 import { extname, join, normalize } from 'node:path';
 
@@ -24,8 +25,16 @@ export interface RouteRequest {
   url: string;
   headers: Record<string, string | undefined>;
   body: string;
-  /** Registers a callback for the client going away. SSE uses it to drop a
-   *  client that closed the tab. */
+  /**
+   * Registers a callback for the client going away. SSE uses it to drop a
+   * client that closed the tab.
+   *
+   * This is the RESPONSE closing, never the request. Once a request body has
+   * been read to its end, Node emits `close` on the IncomingMessage right
+   * away, whether or not the client is still there. Wiring an SSE detach to
+   * that dropped every console client about 15ms after it connected, and is
+   * why a local `/sse` produced 0 bytes across a whole live call.
+   */
   onClose(fn: () => void): void;
 
   /**
@@ -168,6 +177,11 @@ export function createRouter(deps: RouterDeps) {
         // Nothing between here and the browser should buffer an event stream.
         'x-accel-buffering': 'no',
       });
+      // An SSE comment, which every client ignores, sent to push the response
+      // head out now. Node holds the head until the first body write, so
+      // without this a client that connects between events sits with a
+      // pending request and no headers until something happens on the call.
+      res.write(': connected\n\n');
       deps.sse.attach(res, req.headers['last-event-id']);
       req.onClose(() => { deps.sse.detach(res); });
       return;
@@ -265,5 +279,93 @@ export function createRouter(deps: RouterDeps) {
       await reader.cancel().catch(() => undefined);
     }
     if (res.writable()) res.end();
+  };
+}
+
+/**
+ * Adapts Node's `(req, res)` onto the router.
+ *
+ * The one place a socket exists. Reads the body under a cap, flattens the
+ * headers, and wires the SSE detach to the RESPONSE closing rather than the
+ * request, for the reason on `RouteRequest.onClose`.
+ */
+export function createNodeHandler(options: {
+  handle: (req: RouteRequest, res: RouteResponse) => Promise<void>;
+  maxBodyBytes: number;
+  onRequest?: (method: string, url: string) => void;
+}) {
+  return function nodeHandler(req: IncomingMessage, res: ServerResponse): void {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    let tooLarge = false;
+
+    req.on('data', (c: Buffer) => {
+      received += c.length;
+      if (received > options.maxBodyBytes) {
+        if (!tooLarge) {
+          tooLarge = true;
+          res.writeHead(413, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'request body too large' }));
+          req.destroy();
+        }
+        return;
+      }
+      chunks.push(c);
+    });
+
+    req.on('end', () => {
+      if (tooLarge) return;
+      const raw = req.url ?? '/';
+      options.onRequest?.(req.method ?? 'GET', raw);
+
+      const headers: Record<string, string | undefined> = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        headers[k] = typeof v === 'string' ? v : Array.isArray(v) ? v[0] : undefined;
+      }
+
+      // The socket closing before the response finished is the caller
+      // hanging up. Latched, because a listener registered after that has
+      // already happened still has to run: the chat route adds one after
+      // awaiting the harness, and a caller who hung up during that await
+      // would otherwise never reach the reader about to start.
+      let aborted = false;
+      const abortListeners: Array<() => void> = [];
+      res.on('close', () => {
+        if (res.writableFinished) return;
+        aborted = true;
+        for (const fn of abortListeners.splice(0)) fn();
+      });
+
+      // One sink object per request, so its identity is stable: the SSE hub
+      // keys a live client on it.
+      const sink: RouteResponse = {
+        writeHead: (status, h) => { res.writeHead(status, h ?? {}); },
+        write: (chunk) => { res.write(chunk); },
+        end: (chunk) => { chunk === undefined ? res.end() : res.end(chunk); },
+        writable: () => !res.writableEnded && !res.destroyed,
+      };
+
+      void options
+        .handle(
+          {
+            method: req.method ?? 'GET',
+            url: raw,
+            headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+            onClose: (fn) => { res.on('close', fn); },
+            onAborted: (fn) => { if (aborted) fn(); else abortListeners.push(fn); },
+          },
+          sink,
+        )
+        .catch((err: unknown) => {
+          console.error('request handling failed:', err);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'internal error' }));
+            return;
+          }
+          res.destroy();
+        });
+    });
   };
 }
