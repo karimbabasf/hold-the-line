@@ -203,7 +203,7 @@ test('a sub-millisecond lane reports what it took, not zero', () => {
 });
 
 test('a duration reads honestly at both ends of the scale', () => {
-  assert.equal(spokenDuration(0.417), '0.417ms');
+  assert.equal(spokenDuration(0.417), '0.42ms');
   assert.equal(spokenDuration(42.4), '42ms');
   assert.equal(spokenDuration(3_400), '3.4s');
 });

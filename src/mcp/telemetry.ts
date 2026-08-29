@@ -47,8 +47,7 @@ export const millis = (ms: number): number => Math.round(ms * 1000) / 1000;
  */
 export function spokenDuration(ms: number): string {
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
-  if (ms >= 10) return `${Math.round(ms)}ms`;
-  return `${millis(ms)}ms`;
+  return `${ms.toFixed(ms < 10 ? 2 : 0)}ms`;
 }
 
 export interface LaneWindowOptions {
