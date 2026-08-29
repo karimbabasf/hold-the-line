@@ -239,6 +239,14 @@ if (flag === '--show') {
     console.error('pass the new public URL');
     process.exit(1);
   }
+  // The bearer Telnyx presents to us is registered here too, not only on
+  // --create. It is the same value the endpoint checks, so rotating
+  // TELEPHONY_SHARED_SECRET without re-registering leaves Telnyx sending the
+  // old token: every call reaches the endpoint and is turned away with
+  // "rejected an unauthenticated request", which looks exactly like a call
+  // that never arrived.
+  await ensureSecret();
+
   // trycloudflare hands out a new hostname on every restart, so this gets run
   // more often than --create does.
   await api('PATCH', `/ai/assistants/${String(ours['id'])}`, {
