@@ -86,7 +86,7 @@ export interface RouterDeps {
    */
   gate?: {
     pending(): unknown;
-    decide(body: string): { status: number; body: unknown };
+    decide(body: string): Promise<{ status: number; body: unknown }>;
   };
   /** Accepts one batch of console events from another local process.
    *  Absent until the reporting channel is wired; the route 404s without it. */
@@ -211,7 +211,7 @@ export function createRouter(deps: RouterDeps) {
         return;
       }
       if (path === '/gate/decide' && req.method === 'POST') {
-        const result = deps.gate.decide(req.body);
+        const result = await deps.gate.decide(req.body);
         sendJson(res, result.status, result.body);
         return;
       }

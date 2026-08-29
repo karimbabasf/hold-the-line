@@ -196,7 +196,72 @@ const chat = createChatEndpoint({
  * no path here from an unparseable body to a caller hearing a binding
  * sentence.
  */
-function decideFromBody(raw: string): { status: number; body: unknown } {
+const MCP_BASE_URL = process.env.MCP_BASE_URL ?? 'http://localhost:8792';
+const GATE_ADMIN_SECRET = process.env.GATE_ADMIN_SECRET;
+
+/**
+ * Records an operator's approved wording with the tool process, before the
+ * allow goes to TrueForge.
+ *
+ * This is the step that was missing, and without it the approval did
+ * nothing a caller could hear. `offer.state_settlement` never returns the
+ * model's own argument: it returns the text an operator put on file, and
+ * `takeApprovedText` in src/mcp/gated.ts throws rather than falling back
+ * when there is none. So an allow with nothing recorded reached the tool,
+ * the tool threw, and the agent narrated its own failure at the claimant
+ * instead of reading out the sentence a human had just authorised.
+ *
+ * The wording recorded is the draft the operator saw and approved. There is
+ * no editing path on the wire yet, so approving means approving that
+ * sentence, which is exactly what the console showed them.
+ *
+ * Failing here fails the approval closed. Returning false leaves the gate
+ * held rather than sending an allow the tool cannot honour, because a
+ * caller hearing nothing is recoverable and a caller hearing a sentence
+ * nobody stands behind is not.
+ */
+async function recordApprovedWording(gate: ResolvedGate): Promise<boolean> {
+  const utterance = gate.utterance;
+  if (gate.tool !== 'offer.state_settlement') return true;
+  if (!utterance || !gate.claim_id) {
+    console.error(
+      `[gate] cannot record an approval for ${gate.tool_call_id}: no draft or claim on the gate`,
+    );
+    return false;
+  }
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (GATE_ADMIN_SECRET) headers['authorization'] = `Bearer ${GATE_ADMIN_SECRET}`;
+  try {
+    const pending = await fetch(`${MCP_BASE_URL}/gate/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        claim_id: gate.claim_id,
+        wanted: utterance,
+        authorised_amounts: gate.authorised_amounts ?? [],
+      }),
+    });
+    if (!pending.ok) {
+      console.error(`[gate] /gate/pending refused the draft: ${pending.status}`);
+      return false;
+    }
+    const approve = await fetch(`${MCP_BASE_URL}/gate/approve`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ text: utterance }),
+    });
+    if (!approve.ok) {
+      console.error(`[gate] /gate/approve refused the wording: ${approve.status}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[gate] could not reach the tool process to record an approval:', err);
+    return false;
+  }
+}
+
+async function decideFromBody(raw: string): Promise<{ status: number; body: unknown }> {
   let body: { id?: unknown; status?: unknown; reason?: unknown };
   try {
     body = JSON.parse(raw);
@@ -217,6 +282,18 @@ function decideFromBody(raw: string): { status: number; body: unknown } {
   // Read before deciding: decideGate drops the gate, and the console needs
   // the tool name to render the outcome against the draft it showed.
   const held = pendingGates.get(body.id);
+  if (!held) return { status: 404, body: { error: 'no gate is waiting on that id' } };
+
+  // The wording goes on file BEFORE the allow is released. Released first,
+  // the resume can reach the tool before the text does, and the tool throws
+  // on a gate a human had just approved.
+  if (allowed && !(await recordApprovedWording(held))) {
+    return {
+      status: 502,
+      body: { error: 'could not record the approved wording with the tool process' },
+    };
+  }
+
   const settled = decideGate(body.id, decision);
   if (!settled) return { status: 404, body: { error: 'no gate is waiting on that id' } };
 
