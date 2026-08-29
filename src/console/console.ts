@@ -50,7 +50,9 @@ import {
   type LaneEvent,
   type LanesSummaryEvent,
   type NumberEvent,
+  type SandboxEvent,
   type SessionEvent,
+  type ToolEvent,
   type TranscriptEvent,
 } from './events.ts';
 import { createGateClient, type GateResult } from './gate-client.ts';
@@ -121,6 +123,24 @@ export function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)} s`;
 }
 
+/**
+ * The caller's number, as the title of the screen.
+ *
+ * E.164 is what the wire carries and it is the wrong thing to project on a
+ * wall: nobody reads +14155550142 as their own phone. Grouped, it is
+ * recognised across a room, which in a demo is the first question anyone
+ * asks. Anything that is not a plain North American number is shown as it
+ * arrived rather than mangled into a shape it does not have.
+ */
+export function formatCaller(raw: string | undefined): string {
+  if (raw === undefined || raw === '') return 'Caller';
+  if (raw.toLowerCase() === 'unknown') return 'Unknown number';
+  const digits = raw.replace(/[^\d+]/g, '');
+  const na = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(digits);
+  if (na) return `+1 ${na[1]} ${na[2]} ${na[3]}`;
+  return raw;
+}
+
 function formatNumberValue(ev: NumberEvent): string {
   if (ev.unit === 'percent') return `${ev.value}%`;
   if (ev.unit === 'days') return `${ev.value} ${ev.value === 1 ? 'day' : 'days'}`;
@@ -175,6 +195,9 @@ function applyScreen(): void {
   // counting up over an empty screen.
   el('call-stat').hidden = screen === 'idle';
   el('hold-stat').hidden = !(holdRunning && callLive);
+  // The end of a call is said in three places at once, because one of them
+  // is always the one somebody is not looking at.
+  el('ended').hidden = screen !== 'ended';
 
   el('doing-now').textContent = describeActivity();
 }
@@ -242,6 +265,53 @@ function tickClocks(): void {
 // name on it; nobody watching a claim call needs to read `policy.lookup` to
 // understand that the agent is reading the policy.
 
+/**
+ * The MCP server, drawn.
+ *
+ * The whole tool surface is put on screen before the call starts, so a
+ * viewer can see what the agent COULD reach; then each pipe lights as it is
+ * actually used and locks green when that call returns. Drawing it up front
+ * rather than growing it row by row also means the panel is never empty
+ * during the seconds that used to be the deadest part of the demo.
+ *
+ * The catalogue below is this file's own copy of the server's tool list. It
+ * is a starting shape, not a source of truth: a `tool` event naming
+ * something not in it appends a row, so the panel cannot go stale against
+ * the server, it can only be a frame ahead of it.
+ */
+const TOOL_CATALOGUE: readonly string[] = [
+  'claim.snapshot',
+  'policy.lookup',
+  'claim.get',
+  'vehicle.get',
+  'valuation.comps',
+  'lienholder.payoff_quote',
+  'claims_history.get',
+  'state_rules.get',
+  'yard.storage_status',
+  'settlement.calculate',
+  'offer.state_settlement',
+  'settlement.accept',
+  'payment.issue',
+  'salvage.release_vehicle',
+  'coverage.deny',
+];
+
+/** The five the agent cannot speak the result of without an operator click.
+ *  Mirrors `require_approval_for_tools` in agent.json. A live `tool` event
+ *  carrying its own `gated` flag overrides this: the server is closer to the
+ *  truth than a constant here is. */
+const GATED_TOOLS = new Set<string>([
+  'offer.state_settlement',
+  'settlement.accept',
+  'payment.issue',
+  'salvage.release_vehicle',
+  'coverage.deny',
+]);
+
+/** What the five fan-out lookups are doing, in the words a person watching a
+ *  claim call would use. Only used for the activity line; the panel itself
+ *  now shows tool names, because the MCP surface IS the thing being shown. */
 const LANE_WORDS: Record<string, string> = {
   'policy.lookup': 'Reading the policy',
   'valuation.comps': 'Pricing the car against recent sales',
@@ -250,56 +320,143 @@ const LANE_WORDS: Record<string, string> = {
   'state_rules.get': "Checking the state's rules",
 };
 
-function laneWords(ev: LaneEvent): string {
-  const known = LANE_WORDS[ev.tool];
-  if (known) return known;
-  // Unknown tool: fall back to the lane's own human label rather than to the
-  // tool name, which is the one string this screen must never show.
-  return ev.name.charAt(0).toUpperCase() + ev.name.slice(1);
-}
+type ToolStatus = 'idle' | 'pending' | 'done' | 'waiting' | 'error';
 
-interface LaneState {
-  ev: LaneEvent;
+interface ToolRow {
+  status: ToolStatus;
+  gated: boolean;
+  took: string;
+  said: string;
   row: HTMLLIElement;
+  name: HTMLElement;
+  took_el: HTMLElement;
 }
 
-const lanes = new Map<string, LaneState>();
+const toolRows = new Map<string, ToolRow>();
 let settlementKnown = false;
-/** Set by the events that describe themselves better than the lane state
+/** Set by the events that describe themselves better than the tool state
  *  can (a redraft, a dropped line), cleared by the next thing that happens. */
 let activityOverride: string | null = null;
 
+/** Lanes are still tracked, because the parallel-versus-serial counter and
+ *  the activity line both read them. */
+const lanes = new Map<string, LaneEvent>();
+
+function toolRow(tool: string): ToolRow {
+  const found = toolRows.get(tool);
+  if (found) return found;
+
+  const name = h('span', { class: 'tool-name mono' }, [tool]);
+  const took = h('span', { class: 'tool-took mono' }, ['']);
+  const row = h('li', { class: 'tool tool--idle' }, [
+    h('span', { class: 'tool-pipe' }, [h('i', { class: 'tool-pulse' })]),
+    h('span', { class: 'tool-dot' }),
+    name,
+    h('span', { class: 'tool-lock' }, ['gated']),
+    took,
+  ]);
+  if (GATED_TOOLS.has(tool)) row.classList.add('tool--gated');
+  el('tools').appendChild(row);
+
+  const state: ToolRow = { status: 'idle', gated: GATED_TOOLS.has(tool), took: '', said: '', row, name, took_el: took };
+  toolRows.set(tool, state);
+  return state;
+}
+
+function drawTools(): void {
+  el('tools').replaceChildren();
+  toolRows.clear();
+  for (const tool of TOOL_CATALOGUE) toolRow(tool);
+  el('hub-sub').textContent = `${TOOL_CATALOGUE.length} tools`;
+  paintRig();
+}
+
+/** One ring pushed out of the hub, so a request leaving the agent is visible
+ *  even on a tool whose row is off the bottom of a small screen. */
+function fireHub(): void {
+  const ring = el('hub-ring');
+  ring.classList.remove('is-firing');
+  void ring.offsetWidth;
+  ring.classList.add('is-firing');
+}
+
+function paintRig(): void {
+  const rows = [...toolRows.values()];
+  const busy = rows.some((r) => r.status === 'pending');
+  const anyDone = rows.some((r) => r.status === 'done');
+  const rig = el('rig');
+  rig.dataset['busy'] = busy ? '1' : '0';
+  rig.dataset['done'] = !busy && anyDone ? '1' : '0';
+}
+
+function setTool(tool: string, status: ToolStatus, took?: string, said?: string): void {
+  const state = toolRow(tool);
+  // A tool that has already returned is not walked backwards by a late
+  // frame. The one exception is a gate opening on it, which is the operator
+  // being asked about a call that HAS returned and is waiting to be spoken.
+  if (state.status === 'done' && status === 'pending') return;
+  if (status === 'pending' && state.status !== 'pending') fireHub();
+
+  state.status = status;
+  if (took !== undefined) state.took = took;
+  if (said !== undefined) state.said = said;
+
+  state.row.className = `tool tool--${status}${state.gated ? ' tool--gated' : ''}`;
+  state.took_el.textContent =
+    status === 'pending' ? 'running' : status === 'waiting' ? 'waiting on you' : state.took;
+  paintRig();
+}
+
+function markGated(tool: string, gated: boolean): void {
+  const state = toolRow(tool);
+  state.gated = gated;
+  state.row.classList.toggle('tool--gated', gated);
+}
+
+function onTool(ev: ToolEvent): void {
+  activityOverride = null;
+  if (ev.gated !== undefined) markGated(ev.tool, ev.gated);
+  if (ev.status === 'pending') {
+    setTool(ev.tool, 'pending');
+  } else {
+    setTool(ev.tool, ev.status === 'error' ? 'error' : 'done', formatDuration(ev.elapsed_ms ?? 0), ev.summary ?? '');
+  }
+  applyScreen();
+}
+
 function describeActivity(): string {
   if (!callEverStarted) return '';
-  if (!callLive) return 'The call is finished.';
+  if (!callLive) return '';
   if (gateIsOpen) return 'Waiting for your approval';
   if (activityOverride) return activityOverride;
-  const pending = [...lanes.values()].some((l) => l.ev.status === 'pending');
-  if (pending) return 'Looking up the claim record';
+  const rows = [...toolRows.values()];
+  // Nothing has been asked of the server yet, so it is not "working out the
+  // settlement": Telnyx is speaking its greeting and the agent has not been
+  // told anything. Saying otherwise is the panel claiming work it has not
+  // done, which is the one thing this screen exists to not do.
+  if (rows.every((r) => r.status === 'idle')) return 'Answering the call';
+  const running = rows.filter((r) => r.status === 'pending');
+  if (running.length > 1) return `${running.length} calls in flight`;
+  const pendingLane = [...lanes.values()].find((l) => l.status === 'pending');
+  if (pendingLane) return LANE_WORDS[pendingLane.tool] ?? 'Looking up the claim record';
+  if (running.length === 1) return 'Working';
   if (!settlementKnown) return 'Working out the settlement';
   return 'Talking the caller through the numbers';
 }
 
+/**
+ * The five fan-out lookups.
+ *
+ * They now light the same pipes every other tool does, so this handler only
+ * has to keep the lane bookkeeping the counter and the activity line read.
+ * A lane tool therefore produces both a `lane` and a `tool` event and both
+ * land on one row, which is why `setTool` is idempotent about status.
+ */
 function onLane(ev: LaneEvent): void {
   activityOverride = null;
-  let state = lanes.get(ev.tool);
-  if (!state) {
-    const row = h('li', { class: 'step' });
-    el('steps').appendChild(row);
-    state = { ev, row };
-    lanes.set(ev.tool, state);
-  }
-  state.ev = ev;
-  state.row.className = `step step--${ev.status}`;
-  state.row.replaceChildren(
-    h('span', { class: 'step-mark' }, [ev.status === 'done' ? '✓' : '●']),
-    h('span', {}, [
-      laneWords(ev),
-      h('span', { class: 'step-took mono' }, [
-        ev.status === 'done' ? formatDuration(ev.elapsed_ms ?? 0) : 'running',
-      ]),
-    ]),
-  );
+  lanes.set(ev.tool, ev);
+  if (ev.status === 'pending') setTool(ev.tool, 'pending');
+  else setTool(ev.tool, 'done', formatDuration(ev.elapsed_ms ?? 0), ev.summary ?? '');
   applyScreen();
 }
 
@@ -343,28 +500,301 @@ function onLanesSummary(ev: LanesSummaryEvent): void {
 // half-written copies of itself.
 
 const unfinished = new Map<TranscriptEvent['who'], HTMLElement>();
+/** The dots bubble standing in for a speaker who has started talking but
+ *  whose words have not landed yet. At most one per speaker. */
+const speaking = new Map<TranscriptEvent['who'], HTMLElement>();
+/** The last settled line from each speaker, kept so a longer transcription
+ *  of the same words extends it instead of stacking beside it. */
+const settledLine = new Map<TranscriptEvent['who'], { node: HTMLElement; text: string; t: number }>();
+
+/**
+ * True when a settled line is the same utterance as the one before it, only
+ * transcribed further.
+ *
+ * The window matters. A caller who says "Yes." and, thirty seconds later,
+ * "Yes. And what about the rental?" has said two things, and folding those
+ * into one bubble would put words in their mouth that they did not say
+ * together. Inside a few seconds it is one sentence Deepgram sent twice.
+ */
+export function continuesLine(
+  previous: { text: string; t: number } | undefined,
+  next: { text: string; t: number },
+): boolean {
+  if (previous === undefined) return false;
+  if (next.text.length <= previous.text.length) return false;
+  if (!next.text.startsWith(previous.text)) return false;
+  return next.t - previous.t <= CONTINUATION_MS;
+}
+
+/** How long after a line another line may still be the same sentence. */
+const CONTINUATION_MS = 8_000;
+
+function whoWords(who: TranscriptEvent['who']): string {
+  return who === 'caller' ? 'Caller' : 'Agent';
+}
+
+/**
+ * Paints text a word at a time, animating only what just arrived.
+ *
+ * An agent partial carries the WHOLE of what has been said this turn, not
+ * the delta, so repainting naively would re-flash the entire paragraph every
+ * time another clause lands. The words already on screen are found by
+ * common prefix and left as plain text; only the tail is wrapped and
+ * staggered.
+ *
+ * The stagger is capped so the whole reveal finishes inside ~220ms whatever
+ * the length. Motion that delays reading is worse than no motion, and this
+ * screen is read out loud during a demo.
+ */
+export function splitReveal(shown: string, text: string): { head: string; tail: string[] } {
+  const before = shown.split(/(\s+)/);
+  const after = text.split(/(\s+)/);
+
+  let same = 0;
+  while (same < before.length && same < after.length && before[same] === after[same]) same += 1;
+
+  // A partial that does not extend what is on screen is a correction, not a
+  // continuation, and repaints from wherever the two stopped agreeing.
+  return { head: after.slice(0, same).join(''), tail: after.slice(same) };
+}
+
+function paintWords(target: HTMLElement, text: string): void {
+  const { head, tail } = splitReveal(target.dataset['shown'] ?? '', text);
+  const fresh = tail.filter((part) => part.trim() !== '').length;
+  const step = fresh > 0 ? Math.min(16, 220 / fresh) : 0;
+
+  const nodes: Node[] = [];
+  if (head !== '') nodes.push(document.createTextNode(head));
+  let index = 0;
+  for (const part of tail) {
+    if (part.trim() === '') {
+      nodes.push(document.createTextNode(part));
+      continue;
+    }
+    const word = h('span', { class: 'w' }, [part]);
+    word.style.animationDelay = `${Math.round(index * step)}ms`;
+    index += 1;
+    nodes.push(word);
+  }
+  target.replaceChildren(...nodes);
+  target.dataset['shown'] = text;
+}
+
+/**
+ * Scrolls the transcript on the next frame rather than this one.
+ *
+ * `?until=` dispatches a whole call synchronously, so `scrollHeight` read
+ * mid-loop is the height before the browser has laid the new line out and
+ * the view lands short of the bottom. A frame later it is correct, and in
+ * live mode, where events arrive seconds apart, the behaviour is identical.
+ */
+function scrollTranscript(): void {
+  const box = el('transcript');
+  box.scrollTop = box.scrollHeight;
+  window.requestAnimationFrame(() => {
+    box.scrollTop = box.scrollHeight;
+  });
+}
+
+function clearPlaceholder(): void {
+  const placeholder = el('transcript').querySelector('.transcript-empty');
+  if (placeholder) placeholder.remove();
+}
+
+/** Somebody has the floor and has not produced words yet. True the whole
+ *  time Telnyx is speaking its greeting, which used to be a blank screen. */
+function showSpeaking(who: TranscriptEvent['who']): void {
+  if (speaking.has(who) || unfinished.has(who)) return;
+  clearPlaceholder();
+  const bubble = h('div', { class: `line line--${who} line--speaking` }, [
+    h('span', { class: 'line-who' }, [whoWords(who)]),
+    h('div', { class: 'line-text' }, [
+      h('i', { class: 'dot' }),
+      h('i', { class: 'dot' }),
+      h('i', { class: 'dot' }),
+    ]),
+  ]);
+  el('transcript').appendChild(bubble);
+  speaking.set(who, bubble);
+  scrollTranscript();
+}
+
+function hideSpeaking(who: TranscriptEvent['who']): void {
+  const bubble = speaking.get(who);
+  if (!bubble) return;
+  bubble.remove();
+  speaking.delete(who);
+}
+
+function hideAllSpeaking(): void {
+  for (const who of [...speaking.keys()]) hideSpeaking(who);
+}
 
 function onTranscript(ev: TranscriptEvent): void {
   const box = el('transcript');
-  const placeholder = box.querySelector('.transcript-empty');
-  if (placeholder) placeholder.remove();
+  clearPlaceholder();
+  hideSpeaking(ev.who);
+
+  // A caller's words arrive whole, so every one of them is `final: true`.
+  // Deepgram still sends a short transcription and then a longer one
+  // containing it, and each used to open its own bubble: the same sentence
+  // twice, once truncated, which reads on camera as the console losing
+  // track of the call. A line that contains the previous one is the same
+  // line, so it extends it and only the new words animate.
+  const settled = settledLine.get(ev.who);
+  if (settled !== undefined && !unfinished.has(ev.who) && continuesLine(settled, ev)) {
+    const grown = settled.node.querySelector<HTMLElement>('.line-text');
+    if (grown) paintWords(grown, ev.text);
+    settledLine.set(ev.who, { node: settled.node, text: ev.text, t: ev.t });
+    if (ev.who === 'caller' && ev.final && callLive) showSpeaking('agent');
+    scrollTranscript();
+    return;
+  }
 
   let node = unfinished.get(ev.who);
   if (node) {
-    const text = node.querySelector('.line-text');
-    if (text) text.textContent = ev.text;
+    const text = node.querySelector<HTMLElement>('.line-text');
+    if (text) paintWords(text, ev.text);
   } else {
+    const text = h('div', { class: 'line-text' });
     node = h('div', { class: `line line--${ev.who}` }, [
-      h('span', { class: 'line-who' }, [ev.who === 'caller' ? 'Caller' : 'Agent']),
-      h('div', { class: 'line-text' }, [ev.text]),
+      h('span', { class: 'line-who' }, [whoWords(ev.who)]),
+      text,
     ]);
     box.appendChild(node);
+    paintWords(text, ev.text);
   }
   node.className = `line line--${ev.who}${ev.final ? '' : ' line--partial'}`;
-  if (ev.final) unfinished.delete(ev.who);
-  else unfinished.set(ev.who, node);
+  if (ev.final) {
+    unfinished.delete(ev.who);
+    settledLine.set(ev.who, { node, text: ev.text, t: ev.t });
+  } else {
+    unfinished.set(ev.who, node);
+  }
 
-  box.scrollTop = box.scrollHeight;
+  // The caller finished a sentence, so the agent has the floor now. The dots
+  // appear in the bubble the words will fill, so nothing jumps when they do.
+  if (ev.who === 'caller' && ev.final && callLive) showSpeaking('agent');
+
+  scrollTranscript();
+}
+
+/** The transcript's own full stop. */
+function markTranscriptEnd(ms: number): void {
+  hideAllSpeaking();
+  for (const [who, node] of unfinished) {
+    node.className = `line line--${who}`;
+  }
+  unfinished.clear();
+  settledLine.clear();
+  const box = el('transcript');
+  if (box.querySelector('.line-end')) return;
+  if (box.querySelector('.transcript-empty')) return;
+  box.appendChild(h('div', { class: 'line-end' }, [`Call ended at ${formatClock(ms)}`]));
+  scrollTranscript();
+}
+
+// ---------------------------------------------------------------------------
+// The sandbox.
+//
+// The whole provenance claim rests on a figure having been produced by code
+// that actually ran somewhere, so the panel says where that is and links to
+// it. The tile only animates while the container is genuinely executing:
+// a still panel means a still container, which is the only way the animation
+// is worth anything as evidence.
+
+const runIds: string[] = [];
+
+/**
+ * A container id a room can read.
+ *
+ * TrueForge reports Daytona's own handle, `v1:daytona:default.<uuid>`, which
+ * is 45 characters of mostly punctuation and ellipsises into nothing useful
+ * on a panel this width. The provider and the first block of the uuid are
+ * the parts that identify it to a person, and both are true.
+ */
+export function shortSandboxId(id: string): string {
+  const handle = /^v\d+:([a-z0-9-]+):[^.]*\.([0-9a-f]{8})/i.exec(id);
+  if (handle) return `${handle[1]} \u00b7 ${handle[2]}`;
+  return id;
+}
+
+function renderRuns(): void {
+  el('runs').replaceChildren(
+    ...runIds.map((id, i) =>
+      h('span', { class: `run mono${i === runIds.length - 1 ? ' run--last' : ''}` }, [id]),
+    ),
+  );
+}
+
+/**
+ * How long the running state stays on screen at minimum.
+ *
+ * The harness announces no start of execution: it goes quiet, then sends
+ * `sandbox.created` and the tool response in the same millisecond. So the
+ * bridge dates `running` back to the start of the silence and sends both
+ * statuses at once, and a panel that applied them as they arrived would
+ * flash for zero frames and look like nothing ran. The run genuinely
+ * happened across that window, so the tile shows it across that window.
+ */
+const SANDBOX_MIN_RUN_MS = 1_400;
+
+let sandboxRunAt: number | null = null;
+let sandboxIdleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function setSandboxIdle(box: HTMLAnchorElement, id: string | undefined, ran: string): void {
+  box.dataset['run'] = 'idle';
+  if (id) el('sandbox-id').textContent = ran ? `${shortSandboxId(id)} \u00b7 ran ${ran}` : shortSandboxId(id);
+}
+
+function onSandbox(ev: SandboxEvent): void {
+  const box = el<HTMLAnchorElement>('sandbox');
+  if (sandboxIdleTimer !== null) {
+    clearTimeout(sandboxIdleTimer);
+    sandboxIdleTimer = null;
+  }
+
+  if (ev.url) {
+    box.href = ev.url;
+    box.setAttribute('aria-disabled', 'false');
+  }
+  if (ev.status === 'gone') {
+    box.setAttribute('aria-disabled', 'true');
+    box.dataset['run'] = 'idle';
+    sandboxRunAt = null;
+    el('sandbox-id').textContent = 'Detached';
+    return;
+  }
+
+  if (ev.status === 'running') {
+    sandboxRunAt = ev.t;
+    box.dataset['run'] = 'running';
+    el('sandbox-id').textContent = `Running ${ev.label ?? 'code'}`;
+  } else if (ev.status === 'idle') {
+    // The real length of the run, off the two events' own call clocks, not
+    // off how long this panel happened to take to receive them.
+    const ranMs = sandboxRunAt === null ? 0 : Math.max(0, ev.t - sandboxRunAt);
+    const ran = ranMs > 0 ? formatDuration(ranMs) : '';
+    // Only hold when this panel is actually showing a run. An `idle` on its
+    // own, which is what a console joining mid-call receives, settles at once.
+    const wasRunning = box.dataset['run'] === 'running';
+    sandboxRunAt = null;
+    if (wasRunning) {
+      sandboxIdleTimer = setTimeout(() => {
+        sandboxIdleTimer = null;
+        setSandboxIdle(box, ev.id, ran);
+      }, SANDBOX_MIN_RUN_MS);
+    } else {
+      setSandboxIdle(box, ev.id, ran);
+    }
+  } else if (ev.id) {
+    el('sandbox-id').textContent = shortSandboxId(ev.id);
+  }
+
+  if (ev.run_id && !runIds.includes(ev.run_id)) {
+    runIds.push(ev.run_id);
+    renderRuns();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +921,13 @@ function renderMoney(): void {
 
 function onNumber(ev: NumberEvent): void {
   activityOverride = null;
+  // A computed figure names the run that produced it. Collecting them here
+  // means the sandbox panel has something true to show even on a harness
+  // that reports no sandbox lifecycle of its own.
+  if (ev.run_id && !runIds.includes(ev.run_id)) {
+    runIds.push(ev.run_id);
+    renderRuns();
+  }
   if (/^net settlement/i.test(ev.label)) {
     headline = {
       label: ev.label,
@@ -959,12 +1396,16 @@ function mountKeyControl(): void {
 }
 
 function logDecision(t: number, words: string): void {
-  el('decisions').appendChild(
+  const list = el('decisions');
+  list.appendChild(
     h('li', { class: 'decision' }, [
       h('span', { class: 'decision-t mono' }, [formatClock(t)]),
       h('span', {}, [words]),
     ]),
   );
+  // The newest decision is the one that matters, and the list is short
+  // enough to scroll rather than tall enough to show everything.
+  list.scrollTop = list.scrollHeight;
 }
 
 /**
@@ -987,7 +1428,17 @@ function sendBackLocally(gate: GateState, reason: string): void {
   });
 }
 
+/** The gated tool's own pipe goes amber while an operator is being asked
+ *  about it, and green when they answer. The graph therefore shows the gate
+ *  as part of the tool surface, not only as a card over the top of it. */
+function lightGate(ev: GateEvent): void {
+  if (!ev.tool) return;
+  markGated(ev.tool, true);
+  setTool(ev.tool, ev.status === 'opened' ? 'waiting' : 'done');
+}
+
 function onGate(ev: GateEvent): void {
+  lightGate(ev);
   if (ev.status === 'opened') {
     currentGate = {
       id: ev.id,
@@ -1051,11 +1502,26 @@ function resetForNewCall(started: ConsoleEvent): void {
   gateResolutions.clear();
 
   lanes.clear();
-  el('steps').replaceChildren();
+  drawTools();
   el('together').hidden = true;
   el('decisions').replaceChildren();
 
+  runIds.length = 0;
+  renderRuns();
+  if (sandboxIdleTimer !== null) {
+    clearTimeout(sandboxIdleTimer);
+    sandboxIdleTimer = null;
+  }
+  sandboxRunAt = null;
+  const box = el<HTMLAnchorElement>('sandbox');
+  box.setAttribute('aria-disabled', 'true');
+  box.dataset['run'] = 'idle';
+  box.href = '#';
+  el('sandbox-id').textContent = 'Not attached yet';
+
   unfinished.clear();
+  speaking.clear();
+  settledLine.clear();
   el('transcript').replaceChildren(h('p', { class: 'transcript-empty' }, ['Nothing said yet.']));
 
   statementLines = [];
@@ -1087,16 +1553,25 @@ function onCall(ev: CallEvent): void {
     callEverStarted = true;
     callLive = true;
     callEndedAtCallTime = null;
-    el('caller-name').textContent = ev.caller ?? 'Caller';
+    el('caller-name').textContent = formatCaller(ev.caller);
     // "Claim CLM-40218" says claim twice. The caller and the agent both call
     // it claim 40218, so the screen does too.
-    el('claim-line').textContent = ev.claim_id ? `Claim ${ev.claim_id.replace(/^CLM-/i, '')}` : '';
+    el('claim-line').textContent = ev.claim_id
+      ? `Claim ${ev.claim_id.replace(/^CLM-/i, '')} \u00b7 Northvane Mutual`
+      : 'Northvane Mutual claims';
     applyScreen();
+    // Telnyx speaks its greeting the moment it answers, before any of this
+    // has words to show. The agent's bubble goes up now, with the dots in
+    // it, so the screen is alive from the first second of the call rather
+    // than from the first sentence somebody transcribes.
+    showSpeaking('agent');
     return;
   }
   callLive = false;
   gateIsOpen = false;
   callEndedAtCallTime = ev.t;
+  markTranscriptEnd(ev.t);
+  onSandbox({ type: 'sandbox', t: ev.t, status: 'gone' });
   if (gateDismissTimer !== null) {
     clearTimeout(gateDismissTimer);
     gateDismissTimer = null;
@@ -1130,6 +1605,27 @@ function renderCounters(): void {
       : n.recalled > 0
         ? `${n.spoken} numbers said, and ${n.recalled} of them has no source.`
         : `${n.spoken} numbers said, every one traced to a source.`;
+
+  // The band under the header carries the same two claims plus the length of
+  // the call, so the one line a judge reads after the hangup is the whole
+  // result rather than a header that has simply gone grey.
+  if (callEverStarted && !callLive) {
+    const tools = [...toolRows.values()].filter((r) => r.status === 'done').length;
+    el('ended-sum').textContent = [
+      `${formatClock(callEndedAtCallTime ?? 0)} on the line`,
+      `${tools} tool ${tools === 1 ? 'call' : 'calls'}`,
+      n.spoken === 0
+        ? 'no numbers said'
+        : n.recalled > 0
+          ? `${n.recalled} of ${n.spoken} numbers unsourced`
+          : `${n.spoken} numbers, every one sourced`,
+      u.binding === 0
+        ? 'nothing binding said'
+        : u.spokenUnapproved > 0
+          ? `${u.spokenUnapproved} binding said without approval`
+          : `${u.binding} binding ${u.binding === 1 ? 'sentence' : 'sentences'}, all approved first`,
+    ].join(' \u00b7 ');
+  }
 
   el('counter-utterances').textContent =
     u.binding === 0
@@ -1238,6 +1734,12 @@ function dispatch(ev: ConsoleEvent): void {
     case 'transcript':
       onTranscript(ev);
       break;
+    case 'tool':
+      onTool(ev);
+      break;
+    case 'sandbox':
+      onSandbox(ev);
+      break;
   }
   renderCounters();
   tickClocks();
@@ -1303,11 +1805,15 @@ function startLive(url: string): void {
   };
   const types: ConsoleEvent['type'][] = [
     'lane', 'lanes_summary', 'number', 'gate', 'hold', 'session', 'call', 'transcript',
+    'tool', 'sandbox',
   ];
   for (const type of types) source.addEventListener(type, onMessage);
 }
 
 function main(): void {
+  // The tool surface is on screen before anything happens, so the panel is
+  // never blank while a call is connecting.
+  drawTools();
   applyScreen();
   renderMoney();
   setInterval(tickClocks, 250);

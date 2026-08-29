@@ -236,6 +236,64 @@ export interface TranscriptEvent {
   final: boolean;
 }
 
+/**
+ * One MCP tool call, pending then settled.
+ *
+ * `lane` above covers the five fan-out lookups and nothing else, because it
+ * was written for the parallel-versus-serial counter. This covers every tool
+ * on the server, the five lanes included, so the console can draw the whole
+ * MCP surface and light each pipe as it is used. A consumer that wants only
+ * the fan-out still reads `lane`; the two are emitted independently and a
+ * lane tool produces both.
+ *
+ * `gated` marks a tool the agent cannot speak the result of without an
+ * operator click. It is on the tool event rather than looked up client-side
+ * so the console never has to keep its own copy of agent.json's approval
+ * list, which would drift the first time that list changed.
+ */
+export interface ToolEvent {
+  type: 'tool';
+  t: Millis;
+  /** MCP tool name, e.g. "claim.snapshot". */
+  tool: string;
+  status: 'pending' | 'done' | 'error';
+  /** Present when `status` is `'done'` or `'error'`. */
+  elapsed_ms?: number;
+  /** One short line of what came back, for the pane. */
+  summary?: string;
+  /** True for a tool in the harness's `require_approval_for_tools`. */
+  gated?: boolean;
+}
+
+/**
+ * The sandbox the agent computes in.
+ *
+ * The whole provenance claim rests on a figure having been produced by code
+ * that actually ran somewhere, so the console shows where that is and links
+ * to it. `url` is a page a person can open during the demo; `id` is the
+ * harness session or sandbox identifier the run ids on the numbers belong
+ * to.
+ *
+ * `'running'` and `'idle'` are the two states worth animating: they say
+ * whether the container is doing work right now. `'attached'` fires once,
+ * when the session first has a sandbox behind it, and carries the url.
+ */
+export interface SandboxEvent {
+  type: 'sandbox';
+  t: Millis;
+  status: 'attached' | 'running' | 'idle' | 'gone';
+  /** A page a person can open to watch the container. Present on
+   *  `'attached'`, and repeated on later statuses when it is known. */
+  url?: string;
+  /** Harness session or sandbox id, e.g. "sess-7c21". */
+  id?: string;
+  /** What is running, e.g. "settle.ts". Present on `'running'`. */
+  label?: string;
+  /** The run id this execution produced, matching `NumberEvent.run_id`.
+   *  Present on `'idle'` when the run that just finished produced one. */
+  run_id?: string;
+}
+
 export type ConsoleEvent =
   | LaneEvent
   | LanesSummaryEvent
@@ -244,7 +302,9 @@ export type ConsoleEvent =
   | HoldEvent
   | SessionEvent
   | CallEvent
-  | TranscriptEvent;
+  | TranscriptEvent
+  | ToolEvent
+  | SandboxEvent;
 
 /** `Omit` over a union has to be distributed by hand, or it collapses the
  *  seven variants into one object with only their shared keys. */
@@ -303,6 +363,8 @@ const STATUS_SETS: Record<string, ReadonlySet<string> | undefined> = {
   hold: new Set(['started', 'stopped']),
   session: new Set(['suspended', 'resumed']),
   call: new Set(['started', 'ended']),
+  tool: new Set(['pending', 'done', 'error']),
+  sandbox: new Set(['attached', 'running', 'idle', 'gone']),
 };
 
 /**
@@ -344,6 +406,10 @@ export function isConsoleEvent(value: unknown): value is ConsoleEvent {
     case 'session':
       return typeof v['session_id'] === 'string';
     case 'call':
+      return true;
+    case 'tool':
+      return typeof v['tool'] === 'string';
+    case 'sandbox':
       return true;
     case 'transcript':
       return (
@@ -471,7 +537,7 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
   const sources = ['policy.json', 'claim.json', 'vehicle.json', 'comps.json', 'state_rules.json'];
 
   const events: ConsoleEvent[] = [
-    { type: 'call', t: 0, status: 'started', claim_id: 'CLM-40218', caller: 'Daniel Ortiz' },
+    { type: 'call', t: 0, status: 'started', claim_id: 'CLM-40218', caller: '+14155550142' },
     { type: 'transcript', t: 1200, who: 'caller', text: 'Claim 40218, the Outback.', final: false },
     { type: 'transcript', t: 3200, who: 'caller', text: "Claim 40218, the Outback. Shop says it's totaled and the yard is charging me by the day. What am I getting?", final: true },
     { type: 'hold', t: 5_000, status: 'started' },
@@ -603,5 +669,77 @@ export function recordedNorthvaneCall(): ConsoleEvent[] {
     { type: 'call', t: 135_000, status: 'ended', claim_id: 'CLM-40218' },
   ];
 
-  return events;
+
+  /**
+   * The MCP surface and the sandbox, on the same recorded call.
+   *
+   * Held apart from the script above and merged by `t` rather than typed
+   * into it, so the dialogue stays readable as dialogue. Every timestamp
+   * here sits inside a beat the script already has: `claim.snapshot` covers
+   * the pause before the fan-out, and the two `settlement.calculate` runs
+   * bracket the two `settle()` calls the numbers above were read off.
+   *
+   * The five lanes appear twice, once as `lane` and once as `tool`. That is
+   * the live shape too: `lane` feeds the parallel-versus-serial counter,
+   * `tool` lights the pipe, and one lookup produces both.
+   */
+  const SANDBOX_URL = 'http://localhost:8790/sessions/sess-7c21';
+  // TrueForge names the container only once the agent first runs code, and
+  // what it names is Daytona's own handle. Shape captured off a live session
+  // on 2026-08-29, so the recording shows what a real call shows.
+  const CONTAINER = 'v1:daytona:default.a05c9b35-16eb-4394-9f59-1401fa3befcb';
+  const surface: ConsoleEvent[] = [
+    { type: 'sandbox', t: 400, status: 'attached', id: SESSION_ID, url: SANDBOX_URL },
+
+    { type: 'tool', t: 6_000, tool: 'claim.snapshot', status: 'pending' },
+    { type: 'tool', t: 11_500, tool: 'claim.snapshot', status: 'done', elapsed_ms: 5_500,
+      summary: 'claim 40218, 2021 Outback, 52,400 mi' },
+
+    { type: 'tool', t: 8_000, tool: 'policy.lookup', status: 'pending' },
+    { type: 'tool', t: 8_000, tool: 'valuation.comps', status: 'pending' },
+    { type: 'tool', t: 8_000, tool: 'lienholder.payoff_quote', status: 'pending' },
+    { type: 'tool', t: 8_000, tool: 'claims_history.get', status: 'pending' },
+    { type: 'tool', t: 8_000, tool: 'state_rules.get', status: 'pending' },
+    { type: 'tool', t: 9_100, tool: 'policy.lookup', status: 'done', elapsed_ms: 1_100,
+      summary: 'deductible $1,000.00, rental 4 days left' },
+    { type: 'tool', t: 9_600, tool: 'valuation.comps', status: 'done', elapsed_ms: 1_600,
+      summary: '3 comps, mean $21,485.00 at 52,400 mi' },
+    { type: 'tool', t: 10_200, tool: 'lienholder.payoff_quote', status: 'done', elapsed_ms: 2_200,
+      summary: 'payoff $8,764.12 through 2026-10-02' },
+    { type: 'tool', t: 10_800, tool: 'claims_history.get', status: 'done', elapsed_ms: 2_800,
+      summary: '1 prior claim, -$640.00' },
+    { type: 'tool', t: 11_400, tool: 'state_rules.get', status: 'done', elapsed_ms: 3_400,
+      summary: 'AZ threshold 75%, tax 8.6%' },
+
+    // SANDBOX CALL 1: settle({ retain_salvage: false }).
+    { type: 'tool', t: 20_000, tool: 'settlement.calculate', status: 'pending' },
+    { type: 'sandbox', t: 20_000, status: 'running', id: CONTAINER, url: SANDBOX_URL, label: 'settle.ts' },
+    { type: 'tool', t: 21_400, tool: 'settlement.calculate', status: 'done', elapsed_ms: 1_400,
+      summary: 'total loss at 78.6%, net $13,481.12' },
+    { type: 'sandbox', t: 21_400, status: 'idle', id: CONTAINER, url: SANDBOX_URL, run_id: RUN_CASH },
+
+    { type: 'tool', t: 69_600, tool: 'offer.state_settlement', status: 'pending', gated: true },
+    { type: 'tool', t: 82_000, tool: 'offer.state_settlement', status: 'done', elapsed_ms: 12_400,
+      gated: true, summary: 'sent back for a salvage-retention option' },
+
+    // SANDBOX CALL 2: settle({ retain_salvage: true }).
+    { type: 'tool', t: 88_000, tool: 'settlement.calculate', status: 'pending' },
+    { type: 'sandbox', t: 88_000, status: 'running', id: CONTAINER, url: SANDBOX_URL, label: 'settle.ts' },
+    { type: 'tool', t: 89_900, tool: 'settlement.calculate', status: 'done', elapsed_ms: 1_900,
+      summary: 'salvage retained, net $9,180.12' },
+    { type: 'sandbox', t: 89_900, status: 'idle', id: CONTAINER, url: SANDBOX_URL, run_id: RUN_SALVAGE },
+
+    { type: 'tool', t: 97_800, tool: 'offer.state_settlement', status: 'pending', gated: true },
+    { type: 'tool', t: 101_000, tool: 'offer.state_settlement', status: 'done', elapsed_ms: 3_200,
+      gated: true, summary: 'approved, both options' },
+    { type: 'tool', t: 111_800, tool: 'settlement.accept', status: 'pending', gated: true },
+    { type: 'tool', t: 112_000, tool: 'settlement.accept', status: 'done', elapsed_ms: 200,
+      gated: true, summary: 'cash option taken, payment issued' },
+  ];
+
+  // A stable sort by `t`. V8's sort is stable, so an event added here lands
+  // after anything the script already scheduled at the same millisecond, and
+  // the two bookends (`call started` at 0, `call ended` last) keep their
+  // places because nothing above is outside that span.
+  return [...events, ...surface].sort((a, b) => a.t - b.t);
 }
