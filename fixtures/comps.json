@@ -1,0 +1,41 @@
+[
+  {
+    "comp_id": "C-1",
+    "vin_ref": "4S4BTAFC7M3201884",
+    "year": 2021,
+    "make": "Subaru",
+    "model": "Outback",
+    "trim": "Premium",
+    "mileage": 41200,
+    "list_price": 22495.0,
+    "distance_mi": 12,
+    "source": "regional listing feed",
+    "listed_on": "2026-08-19"
+  },
+  {
+    "comp_id": "C-2",
+    "vin_ref": "4S4BTAFC7M3201884",
+    "year": 2021,
+    "make": "Subaru",
+    "model": "Outback",
+    "trim": "Premium",
+    "mileage": 58900,
+    "list_price": 21150.0,
+    "distance_mi": 22,
+    "source": "regional listing feed",
+    "listed_on": "2026-08-24"
+  },
+  {
+    "comp_id": "C-3",
+    "vin_ref": "4S4BTAFC7M3201884",
+    "year": 2021,
+    "make": "Subaru",
+    "model": "Outback",
+    "trim": "Premium",
+    "mileage": 55100,
+    "list_price": 20980.0,
+    "distance_mi": 31,
+    "source": "regional listing feed",
+    "listed_on": "2026-08-16"
+  }
+]

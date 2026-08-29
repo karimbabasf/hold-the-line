@@ -1,0 +1,38 @@
+{
+  "vin": "4S4BTAFC7M3201884",
+  "year": 2021,
+  "make": "Subaru",
+  "model": "Outback",
+  "trim": "Premium",
+  "mileage": 52400,
+  "condition_grade": "average",
+  "options": [
+    {
+      "name": "roof rails",
+      "value": 150.0
+    },
+    {
+      "name": "tow package",
+      "value": 220.0
+    },
+    {
+      "name": "upgraded audio",
+      "value": 125.0
+    }
+  ],
+  "prior_damage": [
+    {
+      "desc": "right rear quarter panel repair, 2024",
+      "deduction": 640.0
+    }
+  ],
+  "lien": {
+    "lender": "Cascade Auto Finance",
+    "loan_id": "CAF-9920431",
+    "principal": 8699.72,
+    "principal_as_of": "2026-08-28",
+    "per_diem": 1.84,
+    "good_through": "2026-10-02"
+  },
+  "salvage_bid": 4301.0
+}
