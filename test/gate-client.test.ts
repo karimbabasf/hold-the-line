@@ -102,7 +102,10 @@ test('with no token nothing is posted at all', async () => {
   const result = await clientOn(impl, null).approve('gate-1');
 
   assert.equal(result.ok, false);
-  assert.match(result.error, /token/i);
+  // The wording is the operator's, not the wire's: the console calls this an
+  // operator key and says where to set it, rather than naming the
+  // environment variable it comes from.
+  assert.match(result.error, /operator key/i);
   assert.equal(sent.length, 0);
 });
 
