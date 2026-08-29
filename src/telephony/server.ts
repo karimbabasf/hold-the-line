@@ -185,10 +185,34 @@ function decideFromBody(raw: string): { status: number; body: unknown } {
         status: 'deny',
         ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
       };
+  // Read before deciding: decideGate drops the gate, and the console needs
+  // the tool name to render the outcome against the draft it showed.
+  const held = pendingGates.get(body.id);
   const settled = decideGate(body.id, decision);
-  return settled
-    ? { status: 200, body: { ok: true } }
-    : { status: 404, body: { error: 'no gate is waiting on that id' } };
+  if (!settled) return { status: 404, body: { error: 'no gate is waiting on that id' } };
+
+  // Broadcast rather than let the clicking console render its own outcome.
+  // More than one console can be watching, and a console that connects after
+  // the click replays this frame out of the buffer, so the decision has to
+  // travel the same way every other event does.
+  live.emit(
+    decision.status === 'allow'
+      ? {
+          type: 'gate',
+          id: body.id,
+          tool: held?.tool ?? 'unknown',
+          status: 'approved',
+          ...(held?.utterance === undefined ? {} : { said: held.utterance }),
+        }
+      : {
+          type: 'gate',
+          id: body.id,
+          tool: held?.tool ?? 'unknown',
+          status: 'sent_back',
+          ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+        },
+  );
+  return { status: 200, body: { ok: true } };
 }
 
 /** Constant-time compare so a wrong token cannot be found byte by byte. */
