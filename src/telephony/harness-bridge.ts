@@ -129,6 +129,91 @@ export function isMissingSession(err: unknown): boolean {
   return err instanceof TrueForgeError && err.status === 404;
 }
 
+/**
+ * What the caller hears when a turn produced nothing speakable at all.
+ *
+ * Withholding an unapproved figure is right. Ending the turn in silence is
+ * not: on the deployed line the caller asked "what is the payout?" and heard
+ * nothing back, on the one beat of the call that matters. Dead air reads as
+ * a dropped call, and a caller who thinks the line died hangs up.
+ *
+ * So this is the floor. It states no figure, commits Northvane to nothing,
+ * and is true whenever it is said, because it is only ever said when a
+ * binding sentence really is waiting on an adjuster. It is deliberately not
+ * a paraphrase of whatever was withheld: the agent's blocked sentence never
+ * reaches the caller in any form.
+ */
+const HOLDING_LINE =
+  'I need to get that confirmed with the adjuster before I can give you a figure.';
+
+/**
+ * Hands a withheld sentence back to the agent so it routes it through the
+ * gate instead of losing it.
+ *
+ * A blocked sentence used to vanish. The agent had no way to learn that what
+ * it just said never left the building, so it moved on and the caller got
+ * silence. This puts the sentence back in front of the agent, inside the
+ * same caller turn, with the one instruction that fixes it: call the gated
+ * tool. Bracketed like the reconnect cue so the agent reads it as direction
+ * rather than as the caller speaking.
+ *
+ * The sentence is the agent's own words going back to the agent, never to
+ * the caller, so returning it here concedes nothing the gate protects.
+ */
+function redraftCue(sentence: string): string {
+  return (
+    `[the sentence below was NOT spoken to the caller. It states a settlement ` +
+    `figure, which commits Northvane, and nothing binding reaches a caller ` +
+    `without an adjuster's approval. Call offer.state_settlement now with ` +
+    `this exact sentence as the utterance argument and the figures in it as ` +
+    `authorised_amounts, then say back what the tool returns, word for word. ` +
+    `Do not state the figure any other way, and do not mention this message ` +
+    `to the caller.]\n\n${sentence}`
+  );
+}
+
+/** State for one caller turn, shared across its gate and redraft rounds. */
+interface TurnState {
+  /** Sentences the amount guard withheld, newest last. Cleared each redraft
+   *  round so the next one answers what the agent just said. */
+  withheld: string[];
+  /** Redraft rounds already spent on this turn. */
+  redrafts: number;
+  /**
+   * Sticky: this turn had something to say and could not say it.
+   *
+   * Set when a binding sentence is withheld or a gate goes unanswered, and
+   * never cleared. It is what makes the holding line TRUE: it is only ever
+   * spoken when a figure really is waiting on an adjuster. A turn where the
+   * model simply produced no text is a different thing and gets no line,
+   * because there is nothing being confirmed and saying so would be a lie.
+   */
+  held: boolean;
+}
+
+/**
+ * How many times one turn may be handed back for a redraft.
+ *
+ * Each round is a whole model turn, so this is seconds of the caller's time.
+ * Two is enough for the agent to take the hint and few enough that a model
+ * that will not take it reaches the holding line while the caller is still
+ * listening.
+ */
+const MAX_REDRAFT_ROUNDS = 2;
+
+/**
+ * How long a gate may sit open before the caller is told why.
+ *
+ * An operator who clicks straight away should not have their approval
+ * talked over, and a caller waiting on a human should not be listening to a
+ * line that sounds dead. A beat and a half separates the two.
+ *
+ * This is a timer that SPEAKS. It cannot approve, deny, or release
+ * anything: when it fires, the turn is still waiting on exactly the same
+ * human decision it was waiting on before.
+ */
+const GATE_QUIET_MS = 1_500;
+
 export function createBridge(opts: BridgeOptions) {
   /**
    * One harness session per caller, so a second utterance continues the same
@@ -340,20 +425,33 @@ export function createBridge(opts: BridgeOptions) {
     callerId: string,
     round: number,
     shaper: SpeechShaper,
+    state: TurnState,
     signal?: AbortSignal,
   ): AsyncGenerator<TurnDelta> {
     const { binding, authorised } = amountsFor(callerId);
 
-    /** Text a caller is allowed to hear, or '' when it is not. Withholds the
-     *  whole message rather than editing the number out of it: a redacted
-     *  sentence is not a sentence anyone should say on a phone call. */
-    const releasable = (text: string): string => {
+    /**
+     * Text a caller is allowed to hear, or '' when it is not.
+     *
+     * Withholds the whole message rather than editing the number out of it:
+     * a redacted sentence is not a sentence anyone should say on a phone
+     * call. A withheld sentence is remembered so it can go back to the agent
+     * to be routed through the gate, rather than simply disappearing, which
+     * is what left the caller listening to nothing.
+     *
+     * `remember` is false for a parked question. A question is not an offer,
+     * so handing it back with "call offer.state_settlement" would be telling
+     * the agent to commit to something it was only asking about.
+     */
+    const releasable = (text: string, remember = true): string => {
       if (!text) return '';
       const blocked = unauthorisedAmounts(text, binding, authorised);
       if (blocked.length === 0) return text;
       console.error(
         `[gate] withheld speech carrying an unauthorised settlement figure: ${blocked.join(', ')}`,
       );
+      state.held = true;
+      if (remember) state.withheld.push(text);
       return '';
     };
 
@@ -428,6 +526,31 @@ export function createBridge(opts: BridgeOptions) {
     if (!pending()) {
       const out = releasable(buffer);
       if (out) yield* speakOut(shaper, out);
+
+      // The turn ended with a binding sentence blocked and no gate opened,
+      // which is the deployed failure: the agent stated the settlement as
+      // ordinary prose, the guard stopped it, and the caller heard nothing.
+      // Hand the sentence back so the agent routes it through the gate
+      // inside this same turn.
+      const sentence = state.withheld.at(-1);
+      if (sentence !== undefined && state.redrafts < MAX_REDRAFT_ROUNDS) {
+        state.redrafts += 1;
+        // Cleared so a second redraft is driven by what the agent said on
+        // the retry, never by the sentence that started it.
+        state.withheld.length = 0;
+        console.warn(
+          `[gate] handing a withheld sentence back to the agent, round ${state.redrafts}`,
+        );
+        yield* runGuarded(
+          sessionId,
+          [{ type: 'user.message', content: redraftCue(sentence) }],
+          callerId,
+          round,
+          shaper,
+          state,
+          signal,
+        );
+      }
       return;
     }
 
@@ -446,7 +569,7 @@ export function createBridge(opts: BridgeOptions) {
       // The question is model-written text on its way to a caller's ear, so
       // it goes through the same check as anything else the agent says.
       if (question.question) {
-        const out = releasable(question.question);
+        const out = releasable(question.question, false);
         if (out) yield* speakOut(shaper, out);
       } else {
         // Nothing to ask means nothing to say. Silence beats inventing a
@@ -468,6 +591,10 @@ export function createBridge(opts: BridgeOptions) {
         gates.push(resolveGate(ref, event.thread_id, source));
       }
     }
+
+    // A gate opened at all means this turn has a binding sentence it cannot
+    // speak yet, which is exactly when the holding line is true.
+    state.held = true;
 
     if (round >= MAX_GATE_ROUNDS) {
       console.error(`[gate] gave up after ${MAX_GATE_ROUNDS} rounds without a settled gate`);
@@ -493,7 +620,25 @@ export function createBridge(opts: BridgeOptions) {
 
     // Settle every gate before acting on any of them, so an abandoned
     // waiter cannot outlive the turn that opened it.
-    const settled = await Promise.all(decisions);
+    const all = Promise.all(decisions);
+
+    // Fill the wait. A gate that is open and waiting on a person is the one
+    // moment where "getting this confirmed" is exactly true, and it is also
+    // the moment the caller was hearing nothing at all: on the deployed line
+    // the stream simply stayed open and silent until the far end gave up.
+    let quiet: ReturnType<typeof setTimeout> | undefined;
+    const spokeSoon = await Promise.race([
+      all.then(() => true),
+      new Promise<boolean>((r) => {
+        quiet = setTimeout(() => r(false), GATE_QUIET_MS);
+      }),
+    ]);
+    clearTimeout(quiet);
+    if (!spokeSoon) {
+      yield* speakOut(shaper, HOLDING_LINE);
+    }
+
+    const settled = await all;
     // No decision is not a decision to allow. One undecided gate holds the
     // whole turn, because the turn resumes as one call or not at all.
     if (settled.some((d) => !d)) return;
@@ -514,7 +659,7 @@ export function createBridge(opts: BridgeOptions) {
       });
     });
 
-    yield* runGuarded(sessionId, resumeInput, callerId, round + 1, shaper, signal);
+    yield* runGuarded(sessionId, resumeInput, callerId, round + 1, shaper, state, signal);
   }
 
   return {
@@ -569,7 +714,9 @@ export function createBridge(opts: BridgeOptions) {
       if (parked) {
         questionByCaller.delete(callerId);
         const shaper = createSpeechShaper();
-        yield* runGuarded(
+        const state: TurnState = { withheld: [], redrafts: 0, held: false };
+        let saidSomething = false;
+        for await (const delta of runGuarded(
           sessionId,
           [
             {
@@ -582,10 +729,20 @@ export function createBridge(opts: BridgeOptions) {
           callerId,
           0,
           shaper,
+          state,
           signal,
-        );
+        )) {
+          saidSomething = true;
+          yield delta;
+        }
         const answeredTail = shaper.end();
-        if (answeredTail) yield { type: 'message.delta', text: answeredTail };
+        if (answeredTail) {
+          saidSomething = true;
+          yield { type: 'message.delta', text: answeredTail };
+        }
+        if (!saidSomething && state.held) {
+          yield { type: 'message.delta', text: HOLDING_LINE };
+        }
         await recordTurn(callerId, sessionId);
         return;
       }
@@ -610,6 +767,7 @@ export function createBridge(opts: BridgeOptions) {
       // attempt costs the resume and never the call. Only before the first
       // delta: retrying after speech would say part of the turn twice.
       let spoke = false;
+      const state: TurnState = { withheld: [], redrafts: 0, held: false };
       try {
         for await (const delta of runGuarded(
           sessionId,
@@ -617,6 +775,7 @@ export function createBridge(opts: BridgeOptions) {
           callerId,
           0,
           shaper,
+          state,
           signal,
         )) {
           spoke = true;
@@ -636,18 +795,33 @@ export function createBridge(opts: BridgeOptions) {
         }).catch(() => {});
         // The reconnect cue goes with the session that is gone. There is
         // nothing to continue, so this is the caller's opening line.
-        yield* runGuarded(
+        for await (const delta of runGuarded(
           sessionId,
           [{ type: 'user.message', content: userText }],
           callerId,
           0,
           shaper,
+          state,
           signal,
-        );
+        )) {
+          spoke = true;
+          yield delta;
+        }
       }
 
       const tail = shaper.end();
-      if (tail) yield { type: 'message.delta', text: tail };
+      if (tail) {
+        spoke = true;
+        yield { type: 'message.delta', text: tail };
+      }
+
+      // The floor. A turn that says nothing is the one outcome a phone call
+      // cannot have, and it is what the deployed line did when the guard
+      // blocked a figure the agent never routed through the gate.
+      if (!spoke && state.held) {
+        console.warn('[gate] turn held everything it had to say, speaking the holding line');
+        yield { type: 'message.delta', text: HOLDING_LINE };
+      }
 
       await recordTurn(callerId, sessionId);
     },
