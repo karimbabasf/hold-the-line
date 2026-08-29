@@ -306,3 +306,32 @@ test('the gate admin routes enforce gateSecret end to end over HTTP when one is 
     await new Promise<void>((resolve) => secured.close(() => resolve()));
   }
 });
+
+// Both found by Qodo's follow-up pass, on the fixes for its first pass.
+test('/gate/pending rejects a non-number in authorised_amounts', async () => {
+  const res = await fetch(`${baseUrl}/gate/pending`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ claim_id: 'CLM-X', wanted: 'w', authorised_amounts: [null] }),
+  });
+  assert.equal(res.status, 400);
+});
+
+test('/gate/pending rejects a numeric string in authorised_amounts', async () => {
+  const res = await fetch(`${baseUrl}/gate/pending`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ claim_id: 'CLM-X', wanted: 'w', authorised_amounts: ['100'] }),
+  });
+  assert.equal(res.status, 400);
+});
+
+test('an oversized body gets a clean 413, not a connection reset', async () => {
+  const res = await fetch(`${baseUrl}/gate/pending`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: 'x'.repeat(300 * 1024),
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.headers.get('connection'), 'close');
+});

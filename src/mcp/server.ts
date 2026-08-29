@@ -452,14 +452,24 @@ async function connectForOneRequest(): Promise<WebStandardStreamableHTTPServerTr
  *  Qodo: the previous version had no limit at all. */
 const MAX_BODY_BYTES = 256 * 1024;
 
+/** Distinguishes an over-limit body from any other failure, so the caller
+ *  can answer with 413 rather than a generic 500. */
+class BodyTooLargeError extends Error {}
+
 async function readRawBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   let received = 0;
   for await (const chunk of req as AsyncIterable<Buffer>) {
     received += chunk.length;
     if (received > MAX_BODY_BYTES) {
-      req.destroy();
-      throw new Error('request body too large');
+      // Do not req.destroy() here: that kills the socket the response
+      // itself needs, so the client sees a connection reset instead of a
+      // clean 413. Just stop reading; the caller responds and this
+      // connection is closed afterwards (see the catch below), which
+      // discards whatever body bytes are still unread rather than letting
+      // them corrupt a later request on the same keep-alive connection.
+      // Found by Qodo, on the fix for the finding right above this one.
+      throw new BodyTooLargeError('request body too large');
     }
     chunks.push(chunk);
   }
@@ -547,9 +557,22 @@ export function createHttpServer(options: { gateSecret?: string } = {}) {
     // otherwise an unhandled rejection outside every route's own try/catch,
     // since readRawBody runs before routing. Found by Qodo.
     handle(req, res).catch((err: unknown) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      if (err instanceof BodyTooLargeError) {
+        // A client mistake, not a server failure: answered as 413, not
+        // logged as an error, and the connection closed afterwards so the
+        // unread remainder of an oversized body cannot be misread as the
+        // start of the next request on the same keep-alive connection.
+        // Found by Qodo, on the previous fix for this same finding.
+        res.setHeader('connection', 'close');
+        sendJson(res, 413, { error: err.message });
+        return;
+      }
       console.error('request handling failed:', err);
-      if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
-      else res.destroy();
+      sendJson(res, 500, { error: 'internal error' });
     });
   });
 
@@ -605,9 +628,16 @@ export function createHttpServer(options: { gateSecret?: string } = {}) {
             !body ||
             typeof body.claim_id !== 'string' ||
             typeof body.wanted !== 'string' ||
-            !Array.isArray(body.authorised_amounts)
+            !Array.isArray(body.authorised_amounts) ||
+            // Array.isArray alone let a null or a numeric string through:
+            // toCents()'s * coerces null to 0, so [null] silently
+            // authorised amount 0. Every element must actually be a
+            // finite number. Found by Qodo.
+            !body.authorised_amounts.every((a) => typeof a === 'number' && Number.isFinite(a))
           ) {
-            sendJson(res, 400, { error: 'expected {claim_id, wanted, authorised_amounts}' });
+            sendJson(res, 400, {
+              error: 'expected {claim_id, wanted, authorised_amounts: number[]}',
+            });
             return;
           }
           setPendingGate({
