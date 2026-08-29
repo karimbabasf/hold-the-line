@@ -468,6 +468,32 @@ const SAFE_TOOLS: readonly ToolEntry[] = [
   },
 ];
 
+/**
+ * What the model actually reads back off a tool result.
+ *
+ * The agent is told to say what `offer.state_settlement` returns word for
+ * word, which is the whole point of the gate: an operator files the wording
+ * and the agent repeats it rather than paraphrasing a binding sentence. That
+ * instruction and a JSON envelope do not mix. Captured on the deployed stack,
+ * a caller heard:
+ *
+ *   {"claim_id":"CLM-40218","wanted":"...","said":"...","authorised_amounts":[...]}
+ *
+ * read out loud. So a result carrying operator-approved text IS that text, and
+ * nothing else reaches the model. The structured fields still exist for the
+ * console, which gets them over the event stream rather than through here.
+ */
+export function spokenResult(result: unknown): string {
+  if (
+    result !== null &&
+    typeof result === 'object' &&
+    typeof (result as { said?: unknown }).said === 'string'
+  ) {
+    return (result as { said: string }).said;
+  }
+  return JSON.stringify(result);
+}
+
 const GATED_TOOLS: readonly ToolEntry[] = [
   {
     name: 'offer.state_settlement',
@@ -563,7 +589,7 @@ export async function callTool(
   try {
     const result = await entry.handler(args);
     closeLane(result);
-    return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    return { content: [{ type: 'text', text: spokenResult(result) }] };
   } catch (err) {
     closeLane(undefined, err ?? new Error('tool failed'));
     return {
