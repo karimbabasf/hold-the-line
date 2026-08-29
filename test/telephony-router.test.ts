@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import {
   createRouter,
+  redactQuery,
   type RouteRequest,
   type RouteResponse,
   type RouterDeps,
@@ -413,4 +414,15 @@ test('the status route 404s when it is not wired, and on the wrong method', asyn
   const b = recorder();
   await wired(request({ method: 'GET', url: '/telnyx/status?k=x' }), b.res);
   assert.equal(b.out.status, 404);
+});
+
+test('the request log does not carry the query token', () => {
+  // The status callback authenticates on a query token, so logging the raw
+  // request target wrote the shared secret into .run/telephony.log.
+  assert.equal(redactQuery('/telnyx/status?k=abc123'), '/telnyx/status?k=REDACTED');
+  assert.equal(redactQuery('/x?token=abc&secret=def'), '/x?token=REDACTED&secret=REDACTED');
+  // What is worth reading in a log survives untouched.
+  assert.equal(redactQuery('/console?demo'), '/console?demo');
+  assert.equal(redactQuery('/console?until=71000'), '/console?until=71000');
+  assert.equal(redactQuery('/sse'), '/sse');
 });

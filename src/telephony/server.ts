@@ -15,7 +15,7 @@ import type { ApprovalDecision, ResolvedGate } from '../trueforge/types.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
 import { createBridge } from './harness-bridge.ts';
 import { createLiveConsole, readTelnyxStatus } from './live-console.ts';
-import { createNodeHandler, createRouter } from './router.ts';
+import { createNodeHandler, createRouter, redactQuery } from './router.ts';
 
 /**
  * The endpoint is on a public tunnel, so it authenticates.
@@ -451,7 +451,7 @@ const server = createServer(
   createNodeHandler({
     handle,
     maxBodyBytes: MAX_BODY_BYTES,
-    onRequest: (method, url) => { console.log(`${method} ${url}`); },
+    onRequest: (method, url) => { console.log(`${method} ${redactQuery(url)}`); },
   }),
 );
 

@@ -131,6 +131,31 @@ function toWebRequest(req: RouteRequest, origin: string, signal: AbortSignal): R
   });
 }
 
+/**
+ * The request line, with anything secret taken out of it.
+ *
+ * The Telnyx status callback authenticates on a query token, because Telnyx
+ * sends it and there is nowhere to put a header. The request log wrote the
+ * whole target, so every callback put the shared secret in plain text in
+ * `.run/telephony.log`, where it survives long after the call does. The
+ * query is still logged, because `/console?demo` and `?until=` are worth
+ * seeing; the values that decide what a caller hears are not.
+ */
+const SECRET_PARAMS = new Set(['k', 'token', 'secret']);
+
+export function redactQuery(url: string): string {
+  const [path, query] = url.split('?');
+  if (query === undefined) return url;
+  const params = new URLSearchParams(query);
+  let touched = false;
+  for (const name of params.keys()) {
+    if (!SECRET_PARAMS.has(name.toLowerCase())) continue;
+    params.set(name, 'REDACTED');
+    touched = true;
+  }
+  return touched ? `${path}?${params.toString()}` : url;
+}
+
 function sendJson(res: RouteResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
