@@ -94,6 +94,7 @@ async function ensureSecret() {
 function manifest(baseUrl: string) {
   return {
     name: ASSISTANT_NAME,
+    greeting: "Hello, you've reached the Northvane Mutual claims line. How can I help you today?",
     model: '',
     external_llm: {
       base_url: `${baseUrl.replace(/\/+$/, '')}/v1`,
@@ -187,6 +188,7 @@ if (flag === '--show') {
   // trycloudflare hands out a new hostname on every restart, so this gets run
   // more often than --create does.
   await api('PATCH', `/ai/assistants/${String(ours['id'])}`, {
+    greeting: "Hello, you've reached the Northvane Mutual claims line. How can I help you today?",
     model: '',
     external_llm: {
       base_url: `${arg.replace(/\/+$/, '')}/v1`,
