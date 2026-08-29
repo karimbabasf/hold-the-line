@@ -78,7 +78,11 @@ test('a rejected token is an error on screen, not a resolved gate', async () => 
   const result = await clientOn(impl).approve('gate-1');
 
   assert.equal(result.ok, false);
-  assert.match(result.error, /token|unauthor/i);
+  assert.match(result.error, /key|unauthor/i);
+  // The console reads this flag, not the message, to decide whether to hand
+  // the operator the key control back. Without it a wrong key locks every
+  // decision for the life of the tab while a caller is held.
+  assert.equal(result.unauthorized, true);
 });
 
 test('a gate nobody is waiting on is reported as such', async () => {

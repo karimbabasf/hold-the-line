@@ -32,7 +32,12 @@ export type GateRequest =
   | { id: string; status: 'allow' }
   | { id: string; status: 'deny'; reason: string };
 
-export type GateResult = { ok: true } | { ok: false; error: string };
+export type GateResult =
+  | { ok: true }
+  /** `unauthorized` marks the one failure the operator can fix themselves:
+   *  the key was wrong. The console reads this flag rather than matching on
+   *  the message, so the wording can change without breaking the recovery. */
+  | { ok: false; error: string; unauthorized?: boolean };
 
 export interface GateClientOptions {
   /** Reads the operator's token at call time. Null when none is stored. */
@@ -46,7 +51,7 @@ const DEFAULT_ENDPOINT = '/gate/decide';
 
 function messageFor(status: number, payload: unknown): string {
   const stated = (payload as { error?: unknown } | null)?.error;
-  if (status === 401) return 'the operator token was rejected. check it and try again.';
+  if (status === 401) return 'That operator key was rejected. Set it again in the bar at the bottom of the screen.';
   if (typeof stated === 'string' && stated !== '') return stated;
   return `the server answered ${status}.`;
 }
@@ -82,7 +87,13 @@ export function createGateClient(options: GateClientOptions) {
     } catch {
       payload = null;
     }
-    if (!response.ok) return { ok: false, error: messageFor(response.status, payload) };
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: messageFor(response.status, payload),
+        ...(response.status === 401 ? { unauthorized: true } : {}),
+      };
+    }
     return { ok: true };
   }
 

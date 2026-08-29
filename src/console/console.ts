@@ -566,6 +566,15 @@ function writeToken(token: string): void {
   }
 }
 
+function clearToken(): void {
+  memoryToken = null;
+  try {
+    window.sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Nothing stored to remove. `memoryToken` above was the only copy.
+  }
+}
+
 let memoryToken: string | null = null;
 
 const gateClient = createGateClient({ token: () => readToken() ?? memoryToken });
@@ -798,6 +807,14 @@ function renderGateOpen(gate: GateState): void {
     btnApprove.disabled = wasDisabled[0] ?? false;
     btnApproveEdits.disabled = wasDisabled[1] ?? false;
     btnSendBack.disabled = wasDisabled[2] ?? false;
+    // A rejected key is the one failure the operator can fix themselves, and
+    // the footer control has already removed itself by now. Throw the bad
+    // key away and put the control back, or they are locked out of every
+    // decision for the life of the tab with a caller held on the line.
+    if (result.unauthorized) {
+      clearToken();
+      mountKeyControl();
+    }
     say(result.error, true);
   }
 
@@ -919,7 +936,9 @@ function mountKeyControl(): void {
     writeToken(value);
     input.value = '';
     // Gone for this tab. Not hidden, removed.
-    slot.replaceChildren(h('span', { class: 'key-done' }, ['Operator key held for this tab']));
+    // "Saved", not "working": nothing has validated it yet. The first gate
+    // decision is what proves it, and a rejection puts this control back.
+    slot.replaceChildren(h('span', { class: 'key-done' }, ['Operator key saved for this tab']));
     setTimeout(() => slot.replaceChildren(), 4000);
   };
 
