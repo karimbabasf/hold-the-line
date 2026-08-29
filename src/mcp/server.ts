@@ -41,7 +41,15 @@ import {
 import { daysBetween, settle } from '../settle/settle.ts';
 import { LANES, type LaneDef } from './lanes.ts';
 import { reportEvent } from './report.ts';
-import { createLaneWindow, laneNameFor, millis, numbersFrom, summarise } from './telemetry.ts';
+import {
+  clipSummary,
+  createLaneWindow,
+  laneNameFor,
+  millis,
+  numbersFrom,
+  summarise,
+  toolSummary,
+} from './telemetry.ts';
 import {
   approveGate,
   coverageDeny,
@@ -95,38 +103,92 @@ const laneWindow = createLaneWindow({ report: (event) => { report(event); } });
  */
 const CONTAINER_TOOLS: ReadonlySet<string> = new Set(['claim.snapshot']);
 
+/**
+ * The tools TrueForge holds for an operator click, as a set to test against.
+ *
+ * Derived from gated.ts's `GATED_TOOL_NAMES`, which the check below already
+ * ties to this file's own `GATED_TOOLS` and which agent.json's
+ * `require_approval_for_tools` is written to match. One constant, so the
+ * console's padlock cannot drift from what is actually gated; re-reading
+ * agent.json here would put a second copy of that list in the process and
+ * make the drift possible again.
+ */
+const GATED_TOOLS_SET: ReadonlySet<string> = new Set<string>(GATED_TOOL_NAMES);
+
 let toolRunCounter = 0;
 /** Provenance for a figure this tool call computed. Prefixed so it can never
  *  be read as one of `settle()`'s own run ids on screen. */
 const nextToolRun = (name: string): string =>
   `tool-${name}-${(toolRunCounter++).toString(36)}`;
 
-/** Reports one tool's lane opening. Returns the function that closes it. */
-function openLane(name: string, runId: string): (result: unknown, error?: unknown) => void {
-  if (CONTAINER_TOOLS.has(name)) return () => {};
+const messageOf = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+/**
+ * Reports one tool call opening, on both of the wires the console reads.
+ * Returns the function that closes it.
+ *
+ * `tool` covers every tool on this server, so the panel that draws the MCP
+ * surface as a hub and a pipe per tool can light a pipe for anything the
+ * agent touches, gated ones included. `lane` covers only the fan-out
+ * lookups and keeps exactly the behaviour it had: a container tool still
+ * reports no lane of its own, because counting `claim.snapshot` beside the
+ * six lookups it fans out would double its wall time in the
+ * parallel-versus-serial figure. A fan-out lookup therefore emits both, on
+ * purpose.
+ *
+ * One wrapper rather than a report call per tool, the same rule `lane()`
+ * and `runLanes` follow: every path that executes a tool in this file
+ * already funnels through here, so a sixteenth tool costs nothing to
+ * instrument and cannot be forgotten.
+ */
+function openTool(name: string, runId: string): (result: unknown, error?: unknown) => void {
+  const isLane = !CONTAINER_TOOLS.has(name);
   const laneName = laneNameFor(name);
+  // Omitted rather than `gated: false` for the other eleven, matching how
+  // every other optional field on these events is reported.
+  const gated = GATED_TOOLS_SET.has(name) ? ({ gated: true } as const) : {};
   const startedAt = performance.now();
-  laneWindow.began();
-  report({ type: 'lane', name: laneName, tool: name, status: 'pending' });
+
+  if (isLane) {
+    laneWindow.began();
+    report({ type: 'lane', name: laneName, tool: name, status: 'pending' });
+  }
+  report({ type: 'tool', tool: name, status: 'pending', ...gated });
 
   return (result: unknown, error?: unknown) => {
     // Fractional milliseconds, not a rounded integer. A fixture read finishes
     // in well under a millisecond, so rounding reported every lane on a live
     // call as 0 and the console rendered "0.0s" for all five. See millis().
     const elapsed = millis(performance.now() - startedAt);
-    laneWindow.ended(elapsed);
+
+    if (isLane) {
+      laneWindow.ended(elapsed);
+      const laneSummary =
+        error === undefined ? summarise(name, result) : `failed: ${messageOf(error)}`;
+      report({
+        type: 'lane',
+        name: laneName,
+        tool: name,
+        status: 'done',
+        elapsed_ms: elapsed,
+        ...(laneSummary ? { summary: laneSummary } : {}),
+      });
+    }
+
+    // The tool event says `error` in its own status, so its summary carries
+    // the message plainly rather than repeating "failed:" in front of it.
     const summary =
-      error === undefined
-        ? summarise(name, result)
-        : `failed: ${error instanceof Error ? error.message : String(error)}`;
+      error === undefined ? toolSummary(name, result) : clipSummary(messageOf(error));
     report({
-      type: 'lane',
-      name: laneName,
+      type: 'tool',
       tool: name,
-      status: 'done',
+      status: error === undefined ? 'done' : 'error',
       elapsed_ms: elapsed,
       ...(summary ? { summary } : {}),
+      ...gated,
     });
+
     if (error !== undefined) return;
     for (const number of numbersFrom(name, result, runId)) report(number);
   };
@@ -295,16 +357,16 @@ export async function claimSnapshot(args: { claim_id: string }) {
    */
   async function lane<T>(tool: string, fn: () => T): Promise<T> {
     const runId = nextToolRun(tool);
-    const closeLane = openLane(tool, runId);
+    const closeTool = openTool(tool, runId);
     const t0 = performance.now();
     try {
       const out = await Promise.resolve(fn());
       timings.push({ lane: tool, elapsed_ms: millis(performance.now() - t0) });
-      closeLane(out);
+      closeTool(out);
       return out;
     } catch (err) {
       timings.push({ lane: tool, elapsed_ms: millis(performance.now() - t0) });
-      closeLane(undefined, err ?? new Error('lookup failed'));
+      closeTool(undefined, err ?? new Error('lookup failed'));
       throw err;
     }
   }
@@ -581,17 +643,17 @@ export async function callTool(
   // lanes.ts), so it is part of what the lane took, and the console's timing
   // has to be the latency an operator would actually be waiting through.
   const runId = nextToolRun(name);
-  const closeLane = openLane(name, runId);
+  const closeTool = openTool(name, runId);
 
   const delay = toolDelay.get(name) ?? 0;
   if (delay > 0) await sleep(delay);
 
   try {
     const result = await entry.handler(args);
-    closeLane(result);
+    closeTool(result);
     return { content: [{ type: 'text', text: spokenResult(result) }] };
   } catch (err) {
-    closeLane(undefined, err ?? new Error('tool failed'));
+    closeTool(undefined, err ?? new Error('tool failed'));
     return {
       content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
       isError: true,
