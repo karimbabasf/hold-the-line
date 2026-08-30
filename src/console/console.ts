@@ -193,6 +193,7 @@ function applyScreen(): void {
   // the call and freezes with it; `hold-stat` appears only while a caller is
   // genuinely holding, which is what stopped the old "CALLER ON HOLD 0:02"
   // counting up over an empty screen.
+  if (screen === 'idle') el('claim-line').textContent = 'Nobody on the line';
   el('call-stat').hidden = screen === 'idle';
   el('hold-stat').hidden = !(holdRunning && callLive);
   // The end of a call is said in three places at once, because one of them
@@ -1574,12 +1575,17 @@ function onCall(ev: CallEvent): void {
     callEverStarted = true;
     callLive = true;
     callEndedAtCallTime = null;
-    el('caller-name').textContent = formatCaller(ev.caller);
+
     // "Claim CLM-40218" says claim twice. The caller and the agent both call
     // it claim 40218, so the screen does too.
-    el('claim-line').textContent = ev.claim_id
-      ? `Claim ${ev.claim_id.replace(/^CLM-/i, '')} \u00b7 Northvane Mutual`
-      : 'Northvane Mutual claims';
+    // Who is on the line, under the name of the line. The title is the desk
+    // an operator is sitting at and does not change; this does.
+    el('claim-line').textContent = [
+      formatCaller(ev.caller),
+      ev.claim_id ? `Claim ${ev.claim_id.replace(/^CLM-/i, '')}` : '',
+    ]
+      .filter((part) => part !== '')
+      .join(' \u00b7 ');
     applyScreen();
     // Telnyx speaks its greeting the moment it answers, before any of this
     // has words to show. The agent's bubble goes up now, with the dots in
@@ -1835,6 +1841,47 @@ function startLive(url: string): void {
     'tool', 'sandbox',
   ];
   for (const type of types) source.addEventListener(type, onMessage);
+
+  // Somebody reset the line. Not a ConsoleEvent: it carries no call data and
+  // nothing renders it. Reloading is the whole handler, because the buffer it
+  // would replay from is already empty.
+  source.addEventListener('reset', () => { window.location.reload(); });
+}
+
+/**
+ * Clears the console for the next call.
+ *
+ * Server-side, not in this tab: the replay buffer is what makes a finished
+ * call survive a reload, so clearing it here is the only thing that sticks,
+ * and it clears for every console attached rather than the one that was
+ * clicked. Carries the operator's own secret, like a gate decision does.
+ */
+function mountReset(): void {
+  const button = el<HTMLButtonElement>('reset');
+  button.addEventListener('click', () => {
+    const token = readToken() ?? memoryToken;
+    if (token === null || token === '') {
+      setHarness('down', 'Set the operator key before resetting');
+      return;
+    }
+    button.disabled = true;
+    button.textContent = 'Resetting';
+    void fetch('/console/reset', { method: 'POST', headers: { authorization: `Bearer ${token}` } })
+      .then((res) => {
+        if (res.ok) {
+          window.location.reload();
+          return;
+        }
+        button.disabled = false;
+        button.textContent = 'Reset';
+        setHarness('down', res.status === 401 ? 'That operator key was refused' : 'Reset failed');
+      })
+      .catch(() => {
+        button.disabled = false;
+        button.textContent = 'Reset';
+        setHarness('down', 'Reset could not reach the line');
+      });
+  });
 }
 
 function main(): void {
@@ -1860,6 +1907,7 @@ function main(): void {
     // A recording has no caller to release, so a click resolves it here.
     gateTransport = replayTransport;
     setHarness('replay', 'Replaying a recorded call. Not a live line.');
+    el('reset').hidden = true;
     startReplay(recordedNorthvaneCall(), speed, until);
     return;
   }
@@ -1871,6 +1919,7 @@ function main(): void {
   // them. The outcome comes back on this same stream.
   gateTransport = liveTransport;
   mountKeyControl();
+  mountReset();
   startLive(liveUrl);
 }
 

@@ -430,6 +430,11 @@ const handle = createRouter({
     decide: decideFromBody,
   },
   ingest: (authorization, body) => live.ingest(authorization, body),
+  resetConsole: () => {
+    disarmIdleEnd();
+    live.reset();
+    console.log('[console] reset, the line is back to empty');
+  },
   telnyxStatus: (body) => {
     const ev = readTelnyxStatus(body);
     console.log(`[telnyx] call status ${ev.status || '(none)'}`);

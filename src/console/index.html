@@ -151,12 +151,12 @@
   .topbar-who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .who-name {
     font-size: 30px;
-    font-weight: 500;
-    letter-spacing: -0.02em;
+    font-weight: 700;
+    letter-spacing: -0.025em;
     line-height: 1.1;
     transition: color 300ms var(--ease-out);
   }
-  .who-sub { font-size: 13px; color: var(--muted); }
+  .who-sub { font-size: 13px; color: var(--muted); min-height: 19px; }
   .topbar-spacer { flex: 1; }
 
   .stat { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
@@ -192,7 +192,6 @@
 
   /* Nothing in the header that measures a call is shown when there is no
      call, so a clock can never run against a dead line. */
-  body[data-state="idle"] .topbar-who,
   body[data-state="idle"] .stat { display: none; }
 
   /* -------------------------------------------------------- the end of it
@@ -253,14 +252,72 @@
   body[data-state="idle"] .idle { display: flex; }
   body[data-state="idle"] .board { display: none; }
 
-  .idle-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 999px;
-    background: var(--faint);
-    margin-bottom: var(--sp-4);
-    animation: breathe 4s ease-in-out infinite;
+  /* ------------------------------------------------------- waiting for a call
+     Rings leaving a point, which is what a line waiting to ring looks like as
+     a picture. Slow and quiet on purpose: this is the screen that is up
+     longest and nobody should be drawn to it. Three rings on a 3.6s cycle,
+     staggered, so there is always one mid-flight and the motion never
+     restarts from nothing. Transform and opacity only. */
+
+  .idle-signal {
+    position: relative;
+    width: 200px;
+    height: 200px;
+    display: grid;
+    place-items: center;
+    margin-bottom: calc(var(--sp-2) * -1);
+    flex: none;
   }
+
+  .idle-core {
+    width: 11px;
+    height: 11px;
+    border-radius: 999px;
+    background: var(--muted);
+    z-index: 1;
+    animation: coreBreathe 3.6s ease-in-out infinite;
+  }
+  @keyframes coreBreathe {
+    0%, 100% { opacity: 0.45; transform: scale(1); }
+    8% { opacity: 1; transform: scale(1.35); }
+    30% { opacity: 0.45; transform: scale(1); }
+  }
+
+  .idle-ring {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 200px;
+    height: 200px;
+    margin: -100px 0 0 -100px;
+    border-radius: 999px;
+    border: 1px solid var(--muted);
+    opacity: 0;
+    animation: ripple 3.6s cubic-bezier(0.16, 0.62, 0.28, 1) infinite;
+  }
+  .idle-ring:nth-child(2) { animation-delay: 1.2s; }
+  .idle-ring:nth-child(3) { animation-delay: 2.4s; }
+  @keyframes ripple {
+    0% { opacity: 0; transform: scale(0.06); }
+    7% { opacity: 0.62; }
+    100% { opacity: 0; transform: scale(1); }
+  }
+
+  /* The line is listening, so the ring that has just left is the brightest
+     thing on the screen and everything after it thins out. */
+  .idle-arc {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 64px;
+    height: 64px;
+    margin: -32px 0 0 -32px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    border-top-color: var(--muted);
+    animation: sweepArc 2.4s linear infinite;
+  }
+  @keyframes sweepArc { to { transform: rotate(360deg); } }
   .idle-h { font-size: 34px; font-weight: 700; letter-spacing: -0.03em; }
   .idle-p { color: var(--muted); font-size: 15px; max-width: 46ch; }
   .idle-num { margin-top: var(--sp-4); font-size: 20px; color: var(--paper); letter-spacing: -0.01em; }
@@ -949,6 +1006,31 @@
   .key-save:hover { border-color: var(--muted); }
   .key-done { font-size: 12.5px; color: var(--muted); }
 
+  /* ------------------------------------------------------------- the reset
+     A demo runs the same call several times, and the replay buffer is what
+     makes the last one persist. This clears it on the server, so every
+     console attached comes back to an empty line, not just this tab. */
+
+  .reset {
+    padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: transform 140ms var(--ease-out), border-color 160ms ease, color 160ms ease;
+  }
+  .reset:active { transform: scale(0.97); }
+  .reset:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  .reset[disabled] { opacity: 0.5; cursor: default; }
+  .reset[hidden] { display: none; }
+  @media (hover: hover) and (pointer: fine) {
+    .reset:hover { border-color: var(--muted); color: var(--paper); }
+  }
+
   /* --------------------------------------------------------------- footer */
 
   .footer {
@@ -996,10 +1078,17 @@
 
   /* Reduced motion keeps every colour change, because the colours ARE the
      information here, and drops every movement. */
+  /* With motion off the rings are static and one is left visible, so the
+     screen still reads as a line listening rather than as an empty box. */
+  @media (prefers-reduced-motion: reduce) {
+    .idle-ring:first-child { opacity: 0.28; transform: scale(0.45); }
+    .idle-core { opacity: 0.8; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .step, .together, .line, .stmt-row, .decision, .gate, .gate-layer, .ended,
     .run, .line-end, .w { animation: none !important; }
-    .rail, .chip::before, .idle-dot, .gate-eyebrow::before, .hub-ring,
+    .rail, .chip::before, .idle-core, .idle-ring, .idle-arc, .gate-eyebrow::before, .hub-ring,
     .tool-pulse, .tool--waiting .tool-dot, .box-scan, .box-glyph, .dot { animation: none !important; }
     .btn, .gate-say, .gate-reason, .box { transition: none !important; }
     .tool--pending .tool-pulse { opacity: 1; }
@@ -1010,8 +1099,8 @@
 
 <header class="topbar">
   <div class="topbar-who">
-    <div id="caller-name" class="who-name mono">Caller</div>
-    <div id="claim-line" class="who-sub">Northvane Mutual claims</div>
+    <h1 class="who-name">Northvane Mutual claims</h1>
+    <div id="claim-line" class="who-sub"></div>
   </div>
   <div class="topbar-spacer"></div>
   <div id="hold-stat" class="stat stat--hold" hidden>
@@ -1023,6 +1112,7 @@
     <span id="call-clock" class="stat-v mono">0:00</span>
   </div>
   <div id="status-chip" class="chip">Line ready</div>
+  <button id="reset" class="reset" type="button" title="Clear the console for the next call">Reset</button>
 </header>
 
 <div id="ended" class="ended" hidden>
@@ -1032,7 +1122,13 @@
 </div>
 
 <section class="idle" aria-label="No call">
-  <div class="idle-dot"></div>
+  <div class="idle-signal" aria-hidden="true">
+    <span class="idle-ring"></span>
+    <span class="idle-ring"></span>
+    <span class="idle-ring"></span>
+    <span class="idle-arc"></span>
+    <span class="idle-core"></span>
+  </div>
   <h1 class="idle-h">The line is ready.</h1>
   <p class="idle-p">Nobody is on the phone. This screen fills up the moment a call comes in.</p>
   <p class="idle-num mono">+1 415 723 8926</p>

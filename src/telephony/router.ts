@@ -103,6 +103,10 @@ export interface RouterDeps {
    * in a URL we hand to Telnyx.
    */
   telnyxStatus?: (body: string) => { status: number; body: unknown };
+  /** Puts the console back to an empty line, for the next run of a demo.
+   *  Carries the operator's own secret, like the gate: whoever can reach it
+   *  can wipe the screen an adjuster is working from. */
+  resetConsole?: () => void;
   /** Origin used to rebuild a Web Standard Request. Only the path and query
    *  matter downstream; this exists so the URL parses. */
   origin?: string;
@@ -266,6 +270,20 @@ export function createRouter(deps: RouterDeps) {
       }
       res.writeHead(405);
       res.end('method not allowed');
+      return;
+    }
+
+    if (path === '/console/reset') {
+      if (!deps.resetConsole || req.method !== 'POST') {
+        sendJson(res, 404, { error: 'not found' });
+        return;
+      }
+      if (!deps.secretMatches(req.headers['authorization'])) {
+        sendJson(res, 401, { error: 'unauthorized' });
+        return;
+      }
+      deps.resetConsole();
+      sendJson(res, 200, { ok: true });
       return;
     }
 

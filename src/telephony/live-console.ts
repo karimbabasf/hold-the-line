@@ -669,9 +669,42 @@ export function createLiveConsole(options: LiveConsoleOptions = {}) {
     }
   }
 
+  /**
+   * Puts the console back to an empty line.
+   *
+   * A demo runs the same call several times, and the replay buffer is what
+   * makes the last one persist: reloading the page replays it, so the screen
+   * opens on a call that is over. Clearing here rather than in the browser is
+   * what makes it stick, and it clears for every console attached, not only
+   * the tab the button was clicked in.
+   *
+   * The clients are kept. They are told to reload, and each comes back to an
+   * empty buffer and the idle screen.
+   */
+  function reset(): void {
+    buffer.length = 0;
+    pinned.clear();
+    ledger.clear();
+    alreadySpoken.clear();
+    pendingCallerText.length = 0;
+    warnedCallers.clear();
+    turnText = '';
+    callStart = null;
+    currentCaller = null;
+    onHold = false;
+    pendingHold = false;
+    callOver = false;
+    pendingEnd = null;
+    // Not a ConsoleEvent: it carries no call data and nothing renders it.
+    // A named SSE frame the client listens for separately, so the event
+    // contract in events.ts stays exactly the eight things a call produces.
+    for (const client of clients) client.write('event: reset\ndata: {}\n\n');
+  }
+
   return {
     broadcast,
     emit,
+    reset,
     attach,
     detach,
     ingest,

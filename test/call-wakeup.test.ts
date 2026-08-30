@@ -315,3 +315,27 @@ test('a sandbox time is clamped into the call it belongs to', () => {
   const running = seen.events().find((e) => e['type'] === 'sandbox' && e['status'] === 'running');
   assert.ok((running?.['t'] as number) < 9_000_000, 'a future timestamp was taken at face value');
 });
+
+test('a reset puts the line back to empty for every console attached', () => {
+  const live = createLiveConsole();
+  const seen = watch(live);
+
+  live.callStarted('+14155550101', '+14155550101');
+  live.callerSaid('My claim number is CLM-40218.', '+14155550101');
+  live.callEnded('+14155550101');
+  assert.ok(live.bufferedFrames() > 0, 'nothing was buffered to reset');
+
+  live.reset();
+
+  assert.equal(live.onCall(), false);
+  assert.equal(live.bufferedFrames(), 0, 'the finished call survived the reset');
+  // Attached clients are kept and told to come back, rather than dropped:
+  // the buffer they would replay from is already empty.
+  assert.equal(live.clientCount(), 1);
+  const frames = seen.events();
+  assert.ok(frames.length > 0, 'the client saw nothing at all');
+
+  // And the line genuinely takes a new call afterwards, from t=0.
+  live.callStarted('+14155559999', '+14155559999');
+  assert.equal(live.onCall(), true);
+});
