@@ -76,6 +76,11 @@ function decideGate(id: string, decision: ApprovalDecision | null): boolean {
 
 const bridge = createBridge({
   forge: new TrueForgeClient({ baseUrl: TRUEFORGE_BASE_URL }),
+  // The link on the sandbox panel opens in the OPERATOR's browser, so it has
+  // to be the host TrueForge is actually served from. Without this the bridge
+  // fell back to localhost independently of the API client, and a remote or
+  // proxied harness sent every operator to a page on their own machine.
+  harnessUrl: TRUEFORGE_BASE_URL,
   agentName: AGENT_NAME,
   onApprovalRequired: (gate, _callerId) => {
     console.log(`[gate] approval required: ${gate.tool} ${gate.tool_call_id}`);
@@ -425,6 +430,11 @@ const handle = createRouter({
     decide: decideFromBody,
   },
   ingest: (authorization, body) => live.ingest(authorization, body),
+  resetConsole: () => {
+    disarmIdleEnd();
+    live.reset();
+    console.log('[console] reset, the line is back to empty');
+  },
   telnyxStatus: (body) => {
     const ev = readTelnyxStatus(body);
     console.log(`[telnyx] call status ${ev.status || '(none)'}`);
@@ -442,6 +452,15 @@ const handle = createRouter({
       // hangup for a call this process was restarted out of, would end the
       // next caller's call the moment it opened.
       if (live.onCall()) live.callEnded();
+    }
+    // The dynamic-variables webhook is the one caller on this route that
+    // reads our answer, and it is holding the greeting until it arrives. It
+    // gets the shape it asked for. This assistant templates no `{{variables}}`
+    // so the object is empty, but an empty one is answered rather than a
+    // wrong one: Telnyx logs a mismatched body as a webhook error, which is
+    // noise on the one surface anybody would look at to debug a dead screen.
+    if (ev.wantsVariables) {
+      return { status: 200, body: { dynamic_variables: {} } };
     }
     return { status: 200, body: { ok: true } };
   },

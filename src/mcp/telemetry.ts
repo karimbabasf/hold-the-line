@@ -206,6 +206,75 @@ export function summarise(tool: string, result: unknown): string | undefined {
   }
 }
 
+/** How much of a summary fits on the tool panel at projector size. */
+const SUMMARY_MAX_CHARS = 60;
+
+/**
+ * One line, whitespace collapsed and cut to fit.
+ *
+ * The cap is not cosmetic. The tool panel draws one row per tool with the
+ * summary beside it, and a row that wraps pushes the rest of the panel off
+ * the bottom of a projected screen. A thrown error's message is the case
+ * that actually overflows: several of the ones in this server run to two
+ * sentences of guidance written for the model to read.
+ */
+export function clipSummary(text: string): string {
+  const line = text.replace(/\s+/g, ' ').trim();
+  if (line.length <= SUMMARY_MAX_CHARS) return line;
+  return `${line.slice(0, SUMMARY_MAX_CHARS - 3).trimEnd()}...`;
+}
+
+/**
+ * The one line the tool panel shows for a result.
+ *
+ * `summarise` above writes the lane rows and already covers every lookup, so
+ * this reuses it rather than restating those cases, and adds the five gated
+ * tools, which have no lane row of their own worth reading. A tool with
+ * nothing worth saying gets no summary at all: a JSON dump of the result is
+ * worse than a blank, because it is unreadable at that size and it is
+ * exactly what the operator is meant to be able to trust this panel not to
+ * do.
+ */
+export function toolSummary(tool: string, result: unknown): string | undefined {
+  const shared = summarise(tool, result);
+  if (shared !== undefined) return clipSummary(shared);
+
+  const r = asRecord(result);
+  if (!r) return undefined;
+
+  switch (tool) {
+    case 'offer.state_settlement': {
+      const raw = r['authorised_amounts'];
+      const amounts = Array.isArray(raw) ? raw.filter((a: unknown) => typeof a === 'number') : [];
+      const money = (amounts as number[]).map(usd).join(' or ');
+      return clipSummary(`operator wording approved${money ? `, ${money}` : ''}`);
+    }
+    case 'settlement.accept': {
+      const amount = num(r, 'amount');
+      const option = typeof r['option'] === 'string' ? r['option'] : '';
+      return amount === null ? undefined : clipSummary(`accepted ${usd(amount)}${option ? `, ${option}` : ''}`);
+    }
+    case 'payment.issue': {
+      const amount = num(r, 'amount');
+      if (amount === null) return undefined;
+      const method = typeof r['method'] === 'string' ? ` by ${r['method']}` : '';
+      const reference = typeof r['reference'] === 'string' ? `, ${r['reference']}` : '';
+      return clipSummary(`${usd(amount)} issued${method}${reference}`);
+    }
+    case 'salvage.release_vehicle': {
+      const yard = typeof r['yard_id'] === 'string' ? ` to yard ${r['yard_id']}` : '';
+      return clipSummary(`vehicle released${yard}, irreversible`);
+    }
+    case 'coverage.deny': {
+      const claim = typeof r['claim_id'] === 'string' ? ` on ${r['claim_id']}` : '';
+      const reason = typeof r['reason'] === 'string' ? `, ${r['reason']}` : '';
+      return clipSummary(`coverage denied${claim}${reason}`);
+    }
+    default:
+      return undefined;
+  }
+}
+
 type Unit = NonNullable<NumberBody['unit']>;
 
 function computed(label: string, value: number, runId: string, unit: Unit): NumberBody {

@@ -140,15 +140,22 @@ async function assignNumber(assistantId: string) {
   console.log(`assigned ${number} via texml app ${String(texmlAppId)}`);
 }
 
+/** A URL with the shared secret taken out, for anything that gets printed.
+ *  A failed write reports what Telnyx has stored, and what it has stored is
+ *  usually a URL of ours carrying a live token. */
+const withoutToken = (value: unknown) => String(value).replace(/([?&]k=)[^&]*/g, '$1REDACTED');
+
 /**
  * Points the TeXML application's status callback at us.
  *
- * This is the only signal on the whole integration that arrives when the
- * phone is answered rather than when the caller has finished a sentence, and
- * the only one that arrives at all when a caller hangs up during silence.
- * Without it the operator console cannot light up until Telnyx has spoken
- * its greeting, heard a sentence and transcribed it, and it never learns
- * that an ordinary call ended.
+ * This is the hangup half, and the only thing that arrives at all when a
+ * caller hangs up during silence. Without it the console never learns that
+ * an ordinary call ended.
+ *
+ * It is NOT the wake-up half, which was the original hope for it. On a real
+ * call it delivered only `completed`, `conversation_ended` and `analyzed`:
+ * everything after the caller had gone. See `pointConversationStart` for
+ * what does arrive at the start and why nothing here can.
  *
  * The token rides in the query string because Telnyx sends this callback
  * itself and there is nowhere to configure an Authorization header on it.
@@ -188,9 +195,69 @@ async function pointStatusCallback(assistantId: string, baseUrl: string) {
   const back = await api('GET', `/texml_applications/${String(appId)}`);
   const stored = (back['data'] as Record<string, unknown>)?.['status_callback'];
   if (stored !== url) {
-    throw new Error(`status_callback did not stick: ${String(stored)}`);
+    throw new Error(`status_callback did not stick: ${withoutToken(stored)}`);
   }
   console.log(`status callback -> ${baseUrl.replace(/\/+$/, '')}/telnyx/status`);
+}
+
+/**
+ * Points the assistant's dynamic-variables webhook at us. This is the wake-up.
+ *
+ * There is exactly one start-side signal on this integration and this is it.
+ * What was tried first, and what each attempt actually returned:
+ *
+ *   - `status_callback_event` on the TeXML application, the field Twilio uses
+ *     to subscribe to initiated/ringing/answered. PATCHed as
+ *     `status_callback_event`, `status_callback_events` and
+ *     `statusCallbackEvent`: all three returned 200 and NONE came back on the
+ *     read. Telnyx's own schema for a TeXML application has no such field, so
+ *     that callback fires on one event and it is the end of the call.
+ *   - Connection-level call-control webhooks, which would give `call.answered`.
+ *     The number's connection IS this TeXML application, and a TeXML
+ *     application has no `webhook_event_url`. Nowhere to point them.
+ *
+ * What works is `dynamic_variables_webhook_url`. Telnyx POSTs it at the start
+ * of the conversation to resolve `{{variables}}`:
+ *
+ *   {"data": {"event_type": "assistant.initialization",
+ *             "payload": {"telnyx_end_user_target": "+1...", ...}}}
+ *
+ * It lands BEFORE the greeting rather than after it, because the greeting is
+ * one of the fields those variables get substituted into. That is earlier
+ * than an `answered` would have been, and it carries the caller's number.
+ *
+ * Two consequences worth knowing:
+ *
+ *   - Telnyx WAITS for the answer, up to
+ *     `dynamic_variables_webhook_timeout_ms` (1500), before it speaks. The
+ *     handler only touches memory, so it replies at once. The timeout is
+ *     left where it is rather than raised: a telephony process that is down
+ *     should cost the caller 1.5s of silence and not ten.
+ *   - The endpoint has to answer `{"dynamic_variables": {}}` rather than its
+ *     usual `{"ok": true}`, or Telnyx records a webhook error against the
+ *     conversation. `server.ts` does.
+ *
+ * Same endpoint and same query-string token as the status callback: Telnyx
+ * signs this webhook but sends no Authorization header we can configure.
+ */
+async function pointConversationStart(assistantId: string, baseUrl: string) {
+  const token = process.env.TELEPHONY_SHARED_SECRET;
+  if (!token) throw new Error('TELEPHONY_SHARED_SECRET is not set');
+
+  const url = `${baseUrl.replace(/\/+$/, '')}/telnyx/status?k=${encodeURIComponent(token)}`;
+  await api('PATCH', `/ai/assistants/${assistantId}`, {
+    dynamic_variables_webhook_url: url,
+  });
+
+  // Telnyx accepts unknown fields with a 200 and stores nothing, so the write
+  // is not evidence. Only the read is.
+  const back = await api('GET', `/ai/assistants/${assistantId}`);
+  const a = (back['data'] ?? back) as Record<string, unknown>;
+  const stored = a['dynamic_variables_webhook_url'];
+  if (stored !== url) {
+    throw new Error(`dynamic_variables_webhook_url did not stick: ${withoutToken(stored)}`);
+  }
+  console.log(`conversation start -> ${baseUrl.replace(/\/+$/, '')}/telnyx/status`);
 }
 
 /**
@@ -228,6 +295,7 @@ if (flag === '--show') {
   console.log(`created assistant ${id}`);
   await assignNumber(id);
   await pointStatusCallback(id, baseUrl);
+  await pointConversationStart(id, baseUrl);
   await verify(id);
 } else if (flag === '--point') {
   const ours = await findOurs();
@@ -259,6 +327,7 @@ if (flag === '--show') {
     },
   });
   await pointStatusCallback(String(ours['id']), arg);
+  await pointConversationStart(String(ours['id']), arg);
   await verify(String(ours['id']));
   console.log(`pointed ${String(ours['id'])} at ${arg}/v1`);
 } else {

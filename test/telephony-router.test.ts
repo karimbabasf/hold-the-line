@@ -426,3 +426,46 @@ test('the request log does not carry the query token', () => {
   assert.equal(redactQuery('/console?until=71000'), '/console?until=71000');
   assert.equal(redactQuery('/sse'), '/sse');
 });
+
+test('the reset route clears the line, and only for somebody holding the key', async () => {
+  let cleared = 0;
+  let keyIsGood = false;
+  const handle = createRouter(
+    deps({
+      secretMatches: () => keyIsGood,
+      resetConsole: () => { cleared += 1; },
+    }),
+  );
+
+  // The line is on a public tunnel and a reset wipes what an adjuster is
+  // working from, so it is authenticated exactly like a gate decision.
+  const refused = recorder();
+  await handle(request({ method: 'POST', url: '/console/reset' }), refused.res);
+  assert.equal(refused.out.status, 401);
+  assert.equal(cleared, 0, 'an unauthenticated request reset the console');
+
+  keyIsGood = true;
+  const ok = recorder();
+  await handle(
+    request({ method: 'POST', url: '/console/reset', headers: { authorization: 'Bearer k' } }),
+    ok.res,
+  );
+  assert.equal(ok.out.status, 200);
+  assert.equal(cleared, 1);
+
+  // A GET is not a reset, so a link or a prefetch cannot clear the screen.
+  const wrongMethod = recorder();
+  await handle(
+    request({ url: '/console/reset', headers: { authorization: 'Bearer k' } }),
+    wrongMethod.res,
+  );
+  assert.equal(wrongMethod.out.status, 404);
+  assert.equal(cleared, 1);
+});
+
+test('the reset route 404s when nothing is wired to it', async () => {
+  const handle = createRouter(deps());
+  const { res, out } = recorder();
+  await handle(request({ method: 'POST', url: '/console/reset' }), res);
+  assert.equal(out.status, 404);
+});
