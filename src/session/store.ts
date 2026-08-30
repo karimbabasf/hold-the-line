@@ -183,6 +183,23 @@ export async function checkpoint(
   });
 }
 
+/**
+ * Drops every checkpoint on disk.
+ *
+ * The operator's reset means the next call is a new call. A checkpoint still
+ * inside the resume window would otherwise hand that call the previous
+ * conversation's harness session, transcript and all, which is the opposite
+ * of what the button says. Goes through the same serialize chain as
+ * checkpoint(), so a write already in flight cannot land after the wipe and
+ * resurrect the session that was just discarded.
+ */
+export async function forgetAll(): Promise<void> {
+  const path = storePath();
+  await serialize(async () => {
+    await writeStore(path, {});
+  });
+}
+
 export async function resume(phone: string, withinMs: number): Promise<StoredSession | null> {
   let store: StoreFile;
   try {

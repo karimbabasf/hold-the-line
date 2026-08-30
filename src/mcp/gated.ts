@@ -102,6 +102,22 @@ export function pendingGate(): GateDraft | undefined {
 }
 
 /**
+ * Drops the pending draft, the operator's decision, and every amount a
+ * previous offer pre-authorised. Called on the operator's reset.
+ *
+ * `authorisedAmountsByClaim` outlives a single gate on purpose, so
+ * `settlement.accept` still has something to check after the offer tool has
+ * returned. Across a reset that is exactly wrong: the claim id is the same
+ * on every call, so an amount approved on one call would let
+ * `settlement.accept` pass on the next one with no human in the loop at all.
+ */
+export function clearGateState(): void {
+  draft = undefined;
+  decision = undefined;
+  authorisedAmountsByClaim.clear();
+}
+
+/**
  * Records the operator's final decision on the current draft. This is the
  * only place a binding utterance's text is allowed to diverge from the
  * model's argument; see the module comment for why that is legitimate.

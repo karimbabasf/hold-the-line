@@ -10,6 +10,7 @@ import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { forgetAll } from '../session/store.ts';
 import { TrueForgeClient } from '../trueforge/client.ts';
 import type { ApprovalDecision, ResolvedGate } from '../trueforge/types.ts';
 import { createChatEndpoint } from './chat-endpoint.ts';
@@ -344,6 +345,43 @@ async function recordApprovedWording(gate: ResolvedGate): Promise<boolean> {
   return mine;
 }
 
+/**
+ * Tells the tool process the operator has reset, so it drops the pending
+ * draft and the amounts a previous offer pre-authorised.
+ *
+ * Queued behind any approval already recording, for the same reason those
+ * are serialised: the two touch one slot in that process, and a reset
+ * landing between a `/gate/pending` and its `/gate/approve` would leave the
+ * approve with no draft to attach to.
+ *
+ * A failure here is logged and swallowed. The tool process being unreachable
+ * must not stop the console clearing, and the gate itself stays fail-closed
+ * either way: `takeApprovedText` throws when nothing is on file rather than
+ * speaking the model's own words.
+ */
+function resetGateState(): Promise<void> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (GATE_ADMIN_SECRET) headers['authorization'] = `Bearer ${GATE_ADMIN_SECRET}`;
+
+  const run = async (): Promise<void> => {
+    try {
+      const res = await fetch(`${MCP_BASE_URL}/gate/reset`, {
+        method: 'POST',
+        headers,
+        body: '{}',
+        signal: AbortSignal.timeout(GATE_RECORD_TIMEOUT_MS),
+      });
+      if (!res.ok) console.warn(`[gate] /gate/reset refused: ${res.status}`);
+    } catch (err) {
+      console.warn('[gate] could not reset the tool process:', err);
+    }
+  };
+
+  const mine = recording.then(run, run);
+  recording = mine.catch(() => undefined);
+  return mine;
+}
+
 async function decideFromBody(raw: string): Promise<{ status: number; body: unknown }> {
   let body: { id?: unknown; status?: unknown; reason?: unknown };
   try {
@@ -433,6 +471,16 @@ const handle = createRouter({
   resetConsole: () => {
     disarmIdleEnd();
     live.reset();
+    // Clearing the screen is the visible third of a reset. The other two
+    // are the bridge's in-memory session per caller and the checkpoint on
+    // disk, and either one left standing hands the next call the previous
+    // conversation: `sessionFor` checks memory first, then the disk within
+    // the ten minute resume window, and only then opens a new session.
+    bridge.forgetAll();
+    void forgetAll().catch((err: unknown) => {
+      console.warn('[console] reset could not clear the checkpoints on disk:', err);
+    });
+    void resetGateState();
     console.log('[console] reset, the line is back to empty');
   },
   telnyxStatus: (body) => {

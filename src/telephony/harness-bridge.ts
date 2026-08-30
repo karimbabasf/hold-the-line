@@ -907,6 +907,26 @@ export function createBridge(opts: BridgeOptions) {
   return {
     sessions,
     wasResumed,
+    /**
+     * Forgets every caller, so the next call opens a new harness session.
+     *
+     * The operator's reset clears the screen. Without this the bridge still
+     * held the caller's session id in memory and `sessionFor` handed the
+     * next call straight back to it, so a reset console filled up with the
+     * previous conversation the moment the phone rang. Every map keyed by
+     * caller is cleared together: leaving one behind (the amounts, say)
+     * carries a previous call's authorisation into a call that never
+     * approved it.
+     */
+    forgetAll(): void {
+      sessions.clear();
+      sandboxIds.clear();
+      callStartTimes.clear();
+      pendingResume.clear();
+      turnsSeen.clear();
+      amountsByCaller.clear();
+      questionByCaller.clear();
+    },
     async *runTurn(
       userText: string,
       callerId: string,

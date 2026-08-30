@@ -52,6 +52,7 @@ import {
 } from './telemetry.ts';
 import {
   approveGate,
+  clearGateState,
   coverageDeny,
   GATED_TOOL_NAMES,
   offerStateSettlement,
@@ -978,6 +979,16 @@ export function createHttpServer(options: { gateSecret?: string } = {}) {
 
       if (url === '/gate' && req.method === 'GET') {
         sendJson(res, 200, pendingGate() ?? null);
+        return;
+      }
+
+      // The operator's reset, forwarded from the telephony process. The
+      // pre-authorised amounts are the reason this exists: they survive a
+      // gate closing, so without a wipe here a fresh call could accept an
+      // amount a human approved on a previous one.
+      if (url === '/gate/reset' && req.method === 'POST') {
+        clearGateState();
+        sendJson(res, 200, { ok: true });
         return;
       }
 
