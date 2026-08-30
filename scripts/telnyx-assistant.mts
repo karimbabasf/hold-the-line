@@ -17,6 +17,52 @@
 
 const API = 'https://api.telnyx.com/v2';
 const ASSISTANT_NAME = 'hold-the-line (hackathon)';
+
+/**
+ * The agent cannot be cut off, by anyone.
+ *
+ * Barge-in was on, so Telnyx kept transcribing while the assistant spoke and
+ * fed whatever came back in as the caller's turn. On a speakerphone that is
+ * the assistant's own voice: the greeting "you've reached the Northvane
+ * Mutual claims line" returned as the user message "She reached the North
+ * Bay Mutual", and the agent answered its own echo. The greeting is the
+ * worst case because it is the longest uninterrupted stretch of TTS on the
+ * call, so it gets its own flag.
+ *
+ * `start_speaking_plan` is carried through unchanged rather than dropped: a
+ * PATCH replaces the whole object, and leaving it out resets the endpointing
+ * thresholds that decide how fast the agent answers, which is the latency
+ * work from earlier in the build.
+ */
+const NO_INTERRUPTIONS = {
+  enable: false,
+  disable_greeting_interruption: true,
+  start_speaking_plan: {
+    wait_seconds: 0.1,
+    transcription_endpointing_plan: {
+      on_punctuation_seconds: 0.1,
+      on_no_punctuation_seconds: 0.1,
+      on_number_seconds: 0.1,
+    },
+    custom_endpointing_rules: null,
+  },
+  interrupt_prediction_threshold: 0,
+} as const;
+
+/** Attacks the same echo one layer lower, on the carrier leg. Off by
+ *  default, and a demo on speakerphone in a loud room is exactly the case
+ *  it exists for. */
+const NOISE_SUPPRESSION = 'deepgram';
+
+/** California is all-party consent and no recorded disclosure exists on this
+ *  line. Telnyx defaults recording ON, so this is stated everywhere
+ *  `telephony_settings` is written, never left to a default. */
+const NO_RECORDING = {
+  enabled: false,
+  channels: 'dual',
+  format: 'mp3',
+  stop_on_conversation_end: false,
+} as const;
 const SECRET_ID = 'hold_the_line_llm';
 
 /** Mirrors the config proven on a live line. Voice is chosen by ear, never
@@ -106,10 +152,12 @@ function manifest(baseUrl: string) {
     enabled_features: ['telephony'],
     voice_settings: { voice: VOICE, voice_speed: 1 },
     transcription: { model: TRANSCRIPTION_MODEL, language: 'en' },
+    interruption_settings: NO_INTERRUPTIONS,
     // California is all-party consent and no recorded disclosure exists on
     // this line, so recording stays off. Telnyx defaults it ON.
     telephony_settings: {
-      recording_settings: { enabled: false, channels: 'dual', format: 'mp3', stop_on_conversation_end: false },
+      recording_settings: NO_RECORDING,
+      noise_suppression: NOISE_SUPPRESSION,
     },
   };
 }
@@ -325,6 +373,12 @@ if (flag === '--show') {
       llm_api_key_ref: SECRET_ID,
       model: 'hold-the-line',
     },
+    interruption_settings: NO_INTERRUPTIONS,
+    // `recording_settings` is restated rather than left to the merge. Telnyx
+    // defaults recording ON, this line is in California, and no recorded
+    // disclosure exists on it. Sending the surrounding object without it
+    // must never be the thing that decides whether the call is recorded.
+    telephony_settings: { noise_suppression: NOISE_SUPPRESSION, recording_settings: NO_RECORDING },
   });
   await pointStatusCallback(String(ours['id']), arg);
   await pointConversationStart(String(ours['id']), arg);
